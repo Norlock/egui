@@ -234,7 +234,7 @@ impl<'open> Window<'open> {
         self
     }
 
-    pub fn display_mode(mut self, new_event: &mut Option<DisplayEvent>) -> Self {
+    pub fn display_event(mut self, new_event: &mut Option<DisplayEvent>) -> Self {
         self.display_event = new_event.take();
         self
     }

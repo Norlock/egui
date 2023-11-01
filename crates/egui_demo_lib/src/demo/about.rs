@@ -17,7 +17,7 @@ impl super::Demo for About {
             .default_width(320.0)
             .default_height(480.0)
             .open(open)
-            .display_mode(&mut self.display_event)
+            .display_event(&mut self.display_event)
             .show(ctx, |ui| {
                 use super::View as _;
                 self.ui(ui);

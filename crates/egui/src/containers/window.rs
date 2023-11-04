@@ -39,6 +39,7 @@ pub struct Window<'open> {
     open: Option<&'open mut bool>,
 }
 
+// Helper function for user space
 pub trait SetEvent {
     fn set(&mut self, display_event: DisplayEvent);
 }
@@ -63,17 +64,6 @@ pub enum DisplayEvent {
 impl DisplayEvent {
     pub fn equals(&self, other: DisplayEvent) -> bool {
         self == &other
-    }
-}
-
-// Helper function for user space
-pub trait SetEvent {
-    fn set(&mut self, display_event: DisplayEvent);
-}
-
-impl SetEvent for Option<DisplayEvent> {
-    fn set(&mut self, display_event: DisplayEvent) {
-        let _ = self.insert(display_event);
     }
 }
 

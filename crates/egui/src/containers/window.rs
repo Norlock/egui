@@ -39,6 +39,16 @@ pub struct Window<'open> {
     open: Option<&'open mut bool>,
 }
 
+pub trait SetEvent {
+    fn set(&mut self, display_event: DisplayEvent);
+}
+
+impl SetEvent for Option<DisplayEvent> {
+    fn set(&mut self, display_event: DisplayEvent) {
+        let _ = self.insert(display_event);
+    }
+}
+
 #[derive(PartialEq, Default, Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub enum DisplayEvent {

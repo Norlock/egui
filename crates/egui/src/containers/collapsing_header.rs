@@ -368,6 +368,7 @@ pub struct CollapsingHeader {
     text: WidgetText,
     default_open: bool,
     open: Option<bool>,
+    display_event: Option<DisplayEvent>,
     id_source: Id,
     enabled: bool,
     selectable: bool,
@@ -396,6 +397,7 @@ impl CollapsingHeader {
             selected: false,
             show_background: false,
             icon: None,
+            display_event: None,
         }
     }
 
@@ -413,6 +415,11 @@ impl CollapsingHeader {
     /// Calling `.open(None)` has no effect (default).
     pub fn open(mut self, open: Option<bool>) -> Self {
         self.open = open;
+        self
+    }
+
+    pub fn display(mut self, new_event: &mut Option<DisplayEvent>) -> Self {
+        self.display_event = new_event.take();
         self
     }
 
@@ -517,8 +524,8 @@ impl CollapsingHeader {
             selectable,
             selected,
             show_background,
+            display_event,
         } = self;
-
         // TODO(emilk): horizontal layout, with icon and text as labels. Insert background behind using Frame.
 
         let id = ui.make_persistent_id(id_source);
@@ -548,7 +555,20 @@ impl CollapsingHeader {
 
         let mut state = CollapsingState::load(ui.ctx(), id, default_open);
 
-        if let Some(open) = open {
+        let request_repaint = display_event.is_some();
+
+        match display_event {
+            Some(DisplayEvent::Hide) => state.set_hidden(true),
+            Some(DisplayEvent::Expand) => state.set_open(true),
+            Some(DisplayEvent::Collapse) => state.set_open(false),
+            Some(DisplayEvent::ToggleHidden) => state.toggle_hidden(),
+            Some(DisplayEvent::ToggleCollapse) => state.set_open(!state.is_open()),
+            None => {}
+        }
+
+        if request_repaint {
+            ui.ctx().request_repaint();
+        } else if let Some(open) = open {
             if open != state.is_open() {
                 state.toggle_open(ui);
                 header_response.mark_changed();

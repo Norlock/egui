@@ -1,6 +1,6 @@
 // WARNING: the code in here is horrible. It is a behemoth that needs breaking up into simpler parts.
 
-use crate::collapsing_header::CollapsingState;
+use crate::collapsing_state::{CollapsingState, CommonCollapse, WindowCollapsingState};
 use crate::{widget_text::WidgetTextGalley, *};
 use epaint::*;
 
@@ -371,13 +371,14 @@ impl<'open> Window<'open> {
         let frame = frame.unwrap_or_else(|| Frame::window(&ctx.style()));
 
         let area_id = area.id;
-        let mut collapsing = CollapsingState::load(ctx, area_id.with("collapsing"), default_open);
+        let mut collapsing =
+            WindowCollapsingState::load(ctx, area_id.with("collapsing"), default_open);
 
         // Borrow open to not consume it.
         // This is for backwards compatibility with events
         fn backwards_compatibility_open(
             open: &mut Option<&mut bool>,
-            collapsing: &CollapsingState,
+            collapsing: &WindowCollapsingState,
         ) {
             if let Some(open) = open {
                 **open = !collapsing.is_hidden();
@@ -484,8 +485,10 @@ impl<'open> Window<'open> {
                 None
             };
 
-            let (content_inner, content_response) = collapsing
-                .show_body_unindented(&mut frame.content_ui, |ui| {
+            let (content_inner, content_response) = CommonCollapse::show_body_unindented(
+                &mut collapsing,
+                &mut frame.content_ui,
+                |ui| {
                     resize.show(ui, |ui| {
                         if title_bar.is_some() {
                             ui.add_space(title_content_spacing);
@@ -497,8 +500,9 @@ impl<'open> Window<'open> {
                             add_contents(ui)
                         }
                     })
-                })
-                .map_or((None, None), |ir| (Some(ir.inner), Some(ir.response)));
+                },
+            )
+            .map_or((None, None), |ir| (Some(ir.inner), Some(ir.response)));
 
             let outer_rect = frame.end(&mut area_content_ui).rect;
             paint_resize_corner(&area_content_ui, &possible, outer_rect, frame_stroke);
@@ -917,7 +921,7 @@ fn show_title_bar(
     ui: &mut Ui,
     title: WidgetText,
     show_close_button: bool,
-    collapsing: &mut CollapsingState,
+    collapse: &mut WindowCollapsingState,
     collapsible: bool,
 ) -> TitleBar {
     let inner_response = ui.horizontal(|ui| {
@@ -933,7 +937,7 @@ fn show_title_bar(
 
         if collapsible {
             ui.add_space(pad);
-            collapsing.show_default_button_with_size(ui, button_size);
+            CommonCollapse::show_default_button_with_size(collapse, ui, button_size);
         }
 
         let title_galley = title.into_galley(ui, Some(false), f32::INFINITY, TextStyle::Heading);
@@ -982,7 +986,7 @@ impl TitleBar {
         outer_rect: Rect,
         content_response: &Option<Response>,
         with_closing_btn: bool,
-        collapsing: &mut CollapsingState,
+        collapsing: &mut WindowCollapsingState,
         collapsible: bool,
     ) {
         if let Some(content_response) = &content_response {

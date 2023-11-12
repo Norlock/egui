@@ -4,6 +4,7 @@
 
 pub(crate) mod area;
 pub mod collapsing_header;
+pub mod collapsing_state;
 mod combo_box;
 pub(crate) mod frame;
 pub mod panel;

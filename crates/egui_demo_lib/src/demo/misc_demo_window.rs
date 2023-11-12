@@ -1,5 +1,5 @@
 use super::*;
-use egui::*;
+use egui::{collapsing_state::CollapsingState, *};
 
 /// Showcase some ui code
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -401,7 +401,7 @@ impl CustomCollapsingHeader {
         ui.label("Example of a collapsing header with custom header:");
 
         let id = ui.make_persistent_id("my_collapsing_header");
-        egui::collapsing_header::CollapsingState::load(ui.ctx(), id, true)
+        egui::collapsing_state::WindowCollapsingState::load(ui.ctx(), id, true)
             .show_header(ui, |ui| {
                 ui.toggle_value(&mut self.selected, "Click to select/unselect");
                 ui.radio_value(&mut self.radio_value, false, "");

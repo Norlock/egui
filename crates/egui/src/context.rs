@@ -1804,10 +1804,12 @@ impl Context {
         ui.horizontal(|ui| {
             ui.label(format!(
                 "{} collapsing headers",
-                self.data(|d| d.count::<containers::collapsing_header::InnerState>())
+                self.data(|d| d.count::<containers::collapsing_state::WidgetCollapsingState>())
             ));
             if ui.button("Reset").clicked() {
-                self.data_mut(|d| d.remove_by_type::<containers::collapsing_header::InnerState>());
+                self.data_mut(|d| {
+                    d.remove_by_type::<containers::collapsing_state::WidgetCollapsingState>()
+                });
             }
         });
 

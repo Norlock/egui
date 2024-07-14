@@ -8,7 +8,7 @@ use crate::{
     },
     TextureAtlas,
 };
-use emath::NumExt as _;
+use emath::{NumExt as _, OrderedFloat};
 
 // ----------------------------------------------------------------------------
 
@@ -56,7 +56,7 @@ impl std::hash::Hash for FontId {
     #[inline(always)]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self { size, family } = self;
-        crate::f32_hash(state, *size);
+        emath::OrderedFloat(*size).hash(state);
         family.hash(state);
     }
 }
@@ -335,6 +335,23 @@ impl FontDefinitions {
             families,
         }
     }
+
+    /// List of all the builtin font names used by `epaint`.
+    #[cfg(feature = "default_fonts")]
+    pub fn builtin_font_names() -> &'static [&'static str] {
+        &[
+            "Ubuntu-Light",
+            "NotoEmoji-Regular",
+            "emoji-icon-font",
+            "Hack",
+        ]
+    }
+
+    /// List of all the builtin font names used by `epaint`.
+    #[cfg(not(feature = "default_fonts"))]
+    pub fn builtin_font_names() -> &'static [&'static str] {
+        &[]
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -348,6 +365,7 @@ impl FontDefinitions {
 /// If you are using `egui`, use `egui::Context::set_fonts` and `egui::Context::fonts`.
 ///
 /// You need to call [`Self::begin_frame`] and [`Self::font_image_delta`] once every frame.
+#[derive(Clone)]
 pub struct Fonts(Arc<Mutex<FontsAndCache>>);
 
 impl Fonts {
@@ -378,8 +396,7 @@ impl Fonts {
     pub fn begin_frame(&self, pixels_per_point: f32, max_texture_side: usize) {
         let mut fonts_and_cache = self.0.lock();
 
-        let pixels_per_point_changed =
-            (fonts_and_cache.fonts.pixels_per_point - pixels_per_point).abs() > 1e-3;
+        let pixels_per_point_changed = fonts_and_cache.fonts.pixels_per_point != pixels_per_point;
         let max_texture_side_changed = fonts_and_cache.fonts.max_texture_side != max_texture_side;
         let font_atlas_almost_full = fonts_and_cache.fonts.atlas.lock().fill_ratio() > 0.8;
         let needs_recreate =
@@ -423,6 +440,12 @@ impl Fonts {
     /// Pass this to [`crate::Tessellator`].
     pub fn texture_atlas(&self) -> Arc<Mutex<TextureAtlas>> {
         self.lock().fonts.atlas.clone()
+    }
+
+    /// The full font atlas image.
+    #[inline]
+    pub fn image(&self) -> crate::FontImage {
+        self.lock().fonts.atlas.lock().image().clone()
     }
 
     /// Current size of the font image.
@@ -525,12 +548,7 @@ impl Fonts {
         font_id: FontId,
         wrap_width: f32,
     ) -> Arc<Galley> {
-        self.layout_job(LayoutJob::simple(
-            text,
-            font_id,
-            crate::Color32::TEMPORARY_COLOR,
-            wrap_width,
-        ))
+        self.layout(text, font_id, crate::Color32::PLACEHOLDER, wrap_width)
     }
 }
 
@@ -549,21 +567,6 @@ impl FontsAndCache {
 
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HashableF32(f32);
-
-#[allow(clippy::derived_hash_with_manual_eq)]
-impl std::hash::Hash for HashableF32 {
-    #[inline(always)]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        crate::f32_hash(state, self.0);
-    }
-}
-
-impl Eq for HashableF32 {}
-
-// ----------------------------------------------------------------------------
-
 /// The collection of fonts used by `epaint`.
 ///
 /// Required in order to paint text.
@@ -573,7 +576,7 @@ pub struct FontsImpl {
     definitions: FontDefinitions,
     atlas: Arc<Mutex<TextureAtlas>>,
     font_impl_cache: FontImplCache,
-    sized_family: ahash::HashMap<(HashableF32, FontFamily), Font>,
+    sized_family: ahash::HashMap<(OrderedFloat<f32>, FontFamily), Font>,
 }
 
 impl FontsImpl {
@@ -590,7 +593,7 @@ impl FontsImpl {
         );
 
         let texture_width = max_texture_side.at_most(8 * 1024);
-        let initial_height = 64;
+        let initial_height = 32; // Keep initial font atlas small, so it is fast to upload to GPU. This will expand as needed anyways.
         let atlas = TextureAtlas::new([texture_width, initial_height]);
 
         let atlas = Arc::new(Mutex::new(atlas));
@@ -623,7 +626,7 @@ impl FontsImpl {
         let FontId { size, family } = font_id;
 
         self.sized_family
-            .entry((HashableF32(*size), family.clone()))
+            .entry((OrderedFloat(*size), family.clone()))
             .or_insert_with(|| {
                 let fonts = &self.definitions.families.get(family);
                 let fonts = fonts

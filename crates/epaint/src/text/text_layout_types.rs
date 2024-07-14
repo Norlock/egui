@@ -74,6 +74,10 @@ pub struct LayoutJob {
 
     /// Justify text so that word-wrapped rows fill the whole [`TextWrapping::max_width`].
     pub justify: bool,
+
+    /// Rounding to the closest ui point (not pixel!) allows the rest of the
+    /// layout code to run on perfect integers, avoiding rounding errors.
+    pub round_output_size_to_nearest_ui_point: bool,
 }
 
 impl Default for LayoutJob {
@@ -87,6 +91,7 @@ impl Default for LayoutJob {
             break_on_newline: true,
             halign: Align::LEFT,
             justify: false,
+            round_output_size_to_nearest_ui_point: true,
         }
     }
 }
@@ -142,7 +147,7 @@ impl LayoutJob {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.sections.is_empty()
     }
@@ -180,15 +185,17 @@ impl std::hash::Hash for LayoutJob {
             break_on_newline,
             halign,
             justify,
+            round_output_size_to_nearest_ui_point,
         } = self;
 
         text.hash(state);
         sections.hash(state);
         wrap.hash(state);
-        crate::f32_hash(state, *first_row_min_height);
+        emath::OrderedFloat(*first_row_min_height).hash(state);
         break_on_newline.hash(state);
         halign.hash(state);
         justify.hash(state);
+        round_output_size_to_nearest_ui_point.hash(state);
     }
 }
 
@@ -214,7 +221,7 @@ impl std::hash::Hash for LayoutSection {
             byte_range,
             format,
         } = self;
-        crate::f32_hash(state, *leading_space);
+        OrderedFloat(*leading_space).hash(state);
         byte_range.hash(state);
         format.hash(state);
     }
@@ -293,9 +300,9 @@ impl std::hash::Hash for TextFormat {
             valign,
         } = self;
         font_id.hash(state);
-        crate::f32_hash(state, *extra_letter_spacing);
+        emath::OrderedFloat(*extra_letter_spacing).hash(state);
         if let Some(line_height) = *line_height {
-            crate::f32_hash(state, line_height);
+            emath::OrderedFloat(line_height).hash(state);
         }
         color.hash(state);
         background.hash(state);
@@ -319,6 +326,24 @@ impl TextFormat {
 
 // ----------------------------------------------------------------------------
 
+/// How to wrap and elide text.
+///
+/// This enum is used in high-level APIs where providing a [`TextWrapping`] is too verbose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum TextWrapMode {
+    /// The text should expand the `Ui` size when reaching its boundary.
+    Extend,
+
+    /// The text should wrap to the next line when reaching the `Ui` boundary.
+    Wrap,
+
+    /// The text should be elided using "…" when reaching the `Ui` boundary.
+    ///
+    /// Note that using [`TextWrapping`] and [`LayoutJob`] offers more control over the elision.
+    Truncate,
+}
+
 /// Controls the text wrapping and elision of a [`LayoutJob`].
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -335,7 +360,7 @@ pub struct TextWrapping {
 
     /// Maximum amount of rows the text galley should have.
     ///
-    /// If this limit is reached, text will be truncated and
+    /// If this limit is reached, text will be truncated
     /// and [`Self::overflow_character`] appended to the final row.
     /// You can detect this by checking [`Galley::elided`].
     ///
@@ -375,7 +400,7 @@ impl std::hash::Hash for TextWrapping {
             break_anywhere,
             overflow_character,
         } = self;
-        crate::f32_hash(state, *max_width);
+        emath::OrderedFloat(*max_width).hash(state);
         max_rows.hash(state);
         break_anywhere.hash(state);
         overflow_character.hash(state);
@@ -394,10 +419,27 @@ impl Default for TextWrapping {
 }
 
 impl TextWrapping {
+    /// Create a [`TextWrapping`] from a [`TextWrapMode`] and an available width.
+    pub fn from_wrap_mode_and_width(mode: TextWrapMode, max_width: f32) -> Self {
+        match mode {
+            TextWrapMode::Extend => Self::no_max_width(),
+            TextWrapMode::Wrap => Self::wrap_at_width(max_width),
+            TextWrapMode::Truncate => Self::truncate_at_width(max_width),
+        }
+    }
+
     /// A row can be as long as it need to be.
     pub fn no_max_width() -> Self {
         Self {
             max_width: f32::INFINITY,
+            ..Default::default()
+        }
+    }
+
+    /// A row can be at most `max_width` wide but can wrap in any number of lines.
+    pub fn wrap_at_width(max_width: f32) -> Self {
+        Self {
+            max_width,
             ..Default::default()
         }
     }
@@ -426,6 +468,9 @@ impl TextWrapping {
 ///   from `egui::InputState` and can change at any time.
 /// - The atlas has become full. This can happen any time a new glyph is added
 ///   to the atlas, which in turn can happen any time new text is laid out.
+///
+/// The name comes from typography, where a "galley" is a metal tray
+/// containing a column of set type, usually the size of a page of text.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Galley {
@@ -450,9 +495,9 @@ pub struct Galley {
     /// `rect.top()` is always 0.0.
     ///
     /// With [`LayoutJob::halign`]:
-    /// * [`Align::LEFT`]: rect.left() == 0.0
-    /// * [`Align::Center`]: rect.center() == 0.0
-    /// * [`Align::RIGHT`]: rect.right() == 0.0
+    /// * [`Align::LEFT`]: `rect.left() == 0.0`
+    /// * [`Align::Center`]: `rect.center() == 0.0`
+    /// * [`Align::RIGHT`]: `rect.right() == 0.0`
     pub rect: Rect,
 
     /// Tight bounding box around all the meshes in all the rows.
@@ -509,8 +554,9 @@ pub struct RowVisuals {
     /// Does NOT include leading or trailing whitespace glyphs!!
     pub mesh_bounds: Rect,
 
-    /// The range of vertices in the mesh the contain glyphs.
-    /// Before comes backgrounds (if any), and after any underlines and strikethrough.
+    /// The range of vertices in the mesh that contain glyphs (as opposed to background, underlines, strikethorugh, etc).
+    ///
+    /// The glyph vertices comes after backgrounds (if any), but before any underlines and strikethrough.
     pub glyph_vertex_range: Range<usize>,
 }
 
@@ -617,19 +663,42 @@ impl Row {
 }
 
 impl Galley {
-    #[inline(always)]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.job.is_empty()
     }
 
     /// The full, non-elided text of the input job.
-    #[inline(always)]
+    #[inline]
     pub fn text(&self) -> &str {
         &self.job.text
     }
 
+    #[inline]
     pub fn size(&self) -> Vec2 {
         self.rect.size()
+    }
+}
+
+impl AsRef<str> for Galley {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        self.text()
+    }
+}
+
+impl std::borrow::Borrow<str> for Galley {
+    #[inline]
+    fn borrow(&self) -> &str {
+        self.text()
+    }
+}
+
+impl std::ops::Deref for Galley {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        self.text()
     }
 }
 
@@ -646,6 +715,11 @@ impl Galley {
             // Empty galley
             Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 0.0))
         }
+    }
+
+    /// Returns a 0-width Rect.
+    pub fn pos_from_cursor(&self, cursor: &Cursor) -> Rect {
+        self.pos_from_pcursor(cursor.pcursor) // pcursor is what TextEdit stores
     }
 
     /// Returns a 0-width Rect.
@@ -684,12 +758,34 @@ impl Galley {
     }
 
     /// Returns a 0-width Rect.
-    pub fn pos_from_cursor(&self, cursor: &Cursor) -> Rect {
-        self.pos_from_pcursor(cursor.pcursor) // pcursor is what TextEdit stores
+    pub fn pos_from_ccursor(&self, ccursor: CCursor) -> Rect {
+        self.pos_from_cursor(&self.from_ccursor(ccursor))
     }
 
-    /// Cursor at the given position within the galley
+    /// Returns a 0-width Rect.
+    pub fn pos_from_rcursor(&self, rcursor: RCursor) -> Rect {
+        self.pos_from_cursor(&self.from_rcursor(rcursor))
+    }
+
+    /// Cursor at the given position within the galley.
+    ///
+    /// A cursor above the galley is considered
+    /// same as a cursor at the start,
+    /// and a cursor below the galley is considered
+    /// same as a cursor at the end.
+    /// This allows implementing text-selection by dragging above/below the galley.
     pub fn cursor_from_pos(&self, pos: Vec2) -> Cursor {
+        if let Some(first_row) = self.rows.first() {
+            if pos.y < first_row.min_y() {
+                return self.begin();
+            }
+        }
+        if let Some(last_row) = self.rows.last() {
+            if last_row.max_y() < pos.y {
+                return self.end();
+            }
+        }
+
         let mut best_y_dist = f32::INFINITY;
         let mut cursor = Cursor::default();
 
@@ -697,7 +793,7 @@ impl Galley {
         let mut pcursor_it = PCursor::default();
 
         for (row_nr, row) in self.rows.iter().enumerate() {
-            let is_pos_within_row = pos.y >= row.min_y() && pos.y <= row.max_y();
+            let is_pos_within_row = row.min_y() <= pos.y && pos.y <= row.max_y();
             let y_dist = (row.min_y() - pos.y).abs().min((row.max_y() - pos.y).abs());
             if is_pos_within_row || y_dist < best_y_dist {
                 best_y_dist = y_dist;
@@ -731,12 +827,22 @@ impl Galley {
                 pcursor_it.offset += row.char_count_including_newline();
             }
         }
+
         cursor
     }
 }
 
 /// ## Cursor positions
 impl Galley {
+    /// Cursor to the first character.
+    ///
+    /// This is the same as [`Cursor::default`].
+    #[inline]
+    #[allow(clippy::unused_self)]
+    pub fn begin(&self) -> Cursor {
+        Cursor::default()
+    }
+
     /// Cursor to one-past last character.
     pub fn end(&self) -> Cursor {
         if self.rows.is_empty() {
@@ -770,10 +876,9 @@ impl Galley {
 
     pub fn end_rcursor(&self) -> RCursor {
         if let Some(last_row) = self.rows.last() {
-            crate::epaint_assert!(!last_row.ends_with_newline);
             RCursor {
                 row: self.rows.len() - 1,
-                column: last_row.char_count_excluding_newline(),
+                column: last_row.char_count_including_newline(),
             }
         } else {
             Default::default()
@@ -827,7 +932,7 @@ impl Galley {
                 pcursor_it.offset += row.char_count_including_newline();
             }
         }
-        crate::epaint_assert!(ccursor_it == self.end().ccursor);
+        debug_assert!(ccursor_it == self.end().ccursor);
         Cursor {
             ccursor: ccursor_it, // clamp
             rcursor: self.end_rcursor(),

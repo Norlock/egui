@@ -43,13 +43,27 @@ impl Default for PaintBezier {
 impl PaintBezier {
     pub fn ui_control(&mut self, ui: &mut egui::Ui) {
         ui.collapsing("Colors", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Fill color:");
-                ui.color_edit_button_srgba(&mut self.fill);
-            });
-            egui::stroke_ui(ui, &mut self.stroke, "Curve Stroke");
-            egui::stroke_ui(ui, &mut self.aux_stroke, "Auxiliary Stroke");
-            egui::stroke_ui(ui, &mut self.bounding_box_stroke, "Bounding Box Stroke");
+            Grid::new("colors")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Fill color");
+                    ui.color_edit_button_srgba(&mut self.fill);
+                    ui.end_row();
+
+                    ui.label("Curve Stroke");
+                    ui.add(&mut self.stroke);
+                    ui.end_row();
+
+                    ui.label("Auxiliary Stroke");
+                    ui.add(&mut self.aux_stroke);
+                    ui.end_row();
+
+                    ui.label("Bounding Box Stroke");
+                    ui.add(&mut self.bounding_box_stroke);
+                    ui.end_row();
+                });
         });
 
         ui.collapsing("Global tessellation options", |ui| {
@@ -141,13 +155,13 @@ impl PaintBezier {
     }
 }
 
-impl super::Demo for PaintBezier {
+impl crate::Demo for PaintBezier {
     fn name(&self) -> &'static str {
         "） Bézier Curve"
     }
 
     fn show(&mut self, ctx: &Context, open: &mut bool) {
-        use super::View as _;
+        use crate::View as _;
         Window::new(self.name())
             .open(open)
             .vscroll(false)
@@ -157,7 +171,7 @@ impl super::Demo for PaintBezier {
     }
 }
 
-impl super::View for PaintBezier {
+impl crate::View for PaintBezier {
     fn ui(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
             ui.add(crate::egui_github_link_file!());

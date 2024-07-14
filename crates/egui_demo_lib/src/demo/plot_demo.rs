@@ -4,9 +4,9 @@ use std::ops::RangeInclusive;
 use egui::*;
 
 use egui_plot::{
-    Arrows, AxisBools, AxisHints, Bar, BarChart, BoxElem, BoxPlot, BoxSpread, CoordinatesFormatter,
-    Corner, GridInput, GridMark, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotImage,
-    PlotPoint, PlotPoints, PlotResponse, Points, Polygon, Text, VLine,
+    Arrows, AxisHints, Bar, BarChart, BoxElem, BoxPlot, BoxSpread, CoordinatesFormatter, Corner,
+    GridInput, GridMark, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotImage, PlotPoint,
+    PlotPoints, PlotResponse, Points, Polygon, Text, VLine,
 };
 
 // ----------------------------------------------------------------------------
@@ -44,13 +44,13 @@ pub struct PlotDemo {
     open_panel: Panel,
 }
 
-impl super::Demo for PlotDemo {
+impl crate::Demo for PlotDemo {
     fn name(&self) -> &'static str {
         "🗠 Plot"
     }
 
     fn show(&mut self, ctx: &Context, open: &mut bool) {
-        use super::View as _;
+        use crate::View as _;
         Window::new(self.name())
             .open(open)
             .default_size(vec2(400.0, 400.0))
@@ -59,10 +59,10 @@ impl super::Demo for PlotDemo {
     }
 }
 
-impl super::View for PlotDemo {
+impl crate::View for PlotDemo {
     fn ui(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            egui::reset_button(ui, self);
+            egui::reset_button(ui, self, "Reset");
             ui.collapsing("Instructions", |ui| {
                 ui.label("Pan by dragging, or scroll (+ shift = horizontal).");
                 ui.label("Box zooming: Right click to zoom in and zoom out using a selection.");
@@ -74,8 +74,8 @@ impl super::View for PlotDemo {
                     ui.label("Zoom with ctrl + scroll.");
                 }
                 ui.label("Reset view with double-click.");
-                ui.add(crate::egui_github_link_file!());
             });
+            ui.add(crate::egui_github_link_file!());
         });
         ui.separator();
         ui.horizontal(|ui| {
@@ -174,7 +174,7 @@ impl LineDemo {
                     ui.add(
                         egui::DragValue::new(circle_radius)
                             .speed(0.1)
-                            .clamp_range(0.0..=f64::INFINITY)
+                            .range(0.0..=f64::INFINITY)
                             .prefix("r: "),
                     );
                     ui.horizontal(|ui| {
@@ -200,7 +200,7 @@ impl LineDemo {
             });
 
             ui.vertical(|ui| {
-                ui.style_mut().wrap = Some(false);
+                ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
                 ui.checkbox(animate, "Animate");
                 ui.checkbox(square, "Square view")
                     .on_hover_text("Always keep the viewport square.");
@@ -277,7 +277,6 @@ impl LineDemo {
         };
         let mut plot = Plot::new("lines_demo")
             .legend(Legend::default())
-            .y_axis_width(4)
             .show_axes(self.show_axes)
             .show_grid(self.show_grid);
         if self.square {
@@ -353,7 +352,7 @@ impl MarkerDemo {
             ui.add(
                 egui::DragValue::new(&mut self.marker_radius)
                     .speed(0.1)
-                    .clamp_range(0.0..=f64::INFINITY)
+                    .range(0.0..=f64::INFINITY)
                     .prefix("Radius: "),
             );
             ui.checkbox(&mut self.automatic_colors, "Automatic colors");
@@ -408,7 +407,7 @@ impl LegendDemo {
     }
 
     fn ui(&mut self, ui: &mut Ui) -> Response {
-        let LegendDemo { config } = self;
+        let Self { config } = self;
 
         egui::Grid::new("settings").show(ui, |ui| {
             ui.label("Text style:");
@@ -432,21 +431,20 @@ impl LegendDemo {
             ui.add(
                 egui::DragValue::new(&mut config.background_alpha)
                     .speed(0.02)
-                    .clamp_range(0.0..=1.0),
+                    .range(0.0..=1.0),
             );
             ui.end_row();
         });
         let legend_plot = Plot::new("legend_demo")
-            .y_axis_width(2)
             .legend(config.clone())
             .data_aspect(1.0);
         legend_plot
             .show(ui, |plot_ui| {
-                plot_ui.line(LegendDemo::line_with_slope(0.5).name("lines"));
-                plot_ui.line(LegendDemo::line_with_slope(1.0).name("lines"));
-                plot_ui.line(LegendDemo::line_with_slope(2.0).name("lines"));
-                plot_ui.line(LegendDemo::sin().name("sin(x)"));
-                plot_ui.line(LegendDemo::cos().name("cos(x)"));
+                plot_ui.line(Self::line_with_slope(0.5).name("lines"));
+                plot_ui.line(Self::line_with_slope(1.0).name("lines"));
+                plot_ui.line(Self::line_with_slope(2.0).name("lines"));
+                plot_ui.line(Self::sin().name("sin(x)"));
+                plot_ui.line(Self::cos().name("cos(x)"));
             })
             .response
     }
@@ -467,7 +465,7 @@ impl CustomAxesDemo {
         }
 
         let values = PlotPoints::from_explicit_callback(
-            move |x| 1.0 / (1.0 + (-2.5 * (x / CustomAxesDemo::MINS_PER_DAY - 2.0)).exp()),
+            move |x| 1.0 / (1.0 + (-2.5 * (x / Self::MINS_PER_DAY - 2.0)).exp()),
             days(0.0)..days(5.0),
             100,
         );
@@ -530,23 +528,27 @@ impl CustomAxesDemo {
             100.0 * y
         }
 
-        let x_fmt = |x, _digits, _range: &RangeInclusive<f64>| {
-            if x < 0.0 * MINS_PER_DAY || x >= 5.0 * MINS_PER_DAY {
+        let time_formatter = |mark: GridMark, _range: &RangeInclusive<f64>| {
+            let minutes = mark.value;
+            if minutes < 0.0 || 5.0 * MINS_PER_DAY <= minutes {
                 // No labels outside value bounds
                 String::new()
-            } else if is_approx_integer(x / MINS_PER_DAY) {
+            } else if is_approx_integer(minutes / MINS_PER_DAY) {
                 // Days
-                format!("Day {}", day(x))
+                format!("Day {}", day(minutes))
             } else {
                 // Hours and minutes
-                format!("{h}:{m:02}", h = hour(x), m = minute(x))
+                format!("{h}:{m:02}", h = hour(minutes), m = minute(minutes))
             }
         };
 
-        let y_fmt = |y, _digits, _range: &RangeInclusive<f64>| {
-            // Display only integer percentages
-            if !is_approx_zero(y) && is_approx_integer(100.0 * y) {
-                format!("{:.0}%", percent(y))
+        let percentage_formatter = |mark: GridMark, _range: &RangeInclusive<f64>| {
+            let percent = 100.0 * mark.value;
+            if is_approx_zero(percent) {
+                String::new() // skip zero
+            } else if is_approx_integer(percent) {
+                // Display only integer percentages
+                format!("{percent:.0}%")
             } else {
                 String::new()
             }
@@ -565,15 +567,14 @@ impl CustomAxesDemo {
         ui.label("Zoom in on the X-axis to see hours and minutes");
 
         let x_axes = vec![
-            AxisHints::default().label("Time").formatter(x_fmt),
-            AxisHints::default().label("Value"),
+            AxisHints::new_x().label("Time").formatter(time_formatter),
+            AxisHints::new_x().label("Value"),
         ];
         let y_axes = vec![
-            AxisHints::default()
+            AxisHints::new_y()
                 .label("Percent")
-                .formatter(y_fmt)
-                .max_digits(4),
-            AxisHints::default()
+                .formatter(percentage_formatter),
+            AxisHints::new_y()
                 .label("Absolute")
                 .placement(egui_plot::HPlacement::Right),
         ];
@@ -581,10 +582,10 @@ impl CustomAxesDemo {
             .data_aspect(2.0 * MINS_PER_DAY as f32)
             .custom_x_axes(x_axes)
             .custom_y_axes(y_axes)
-            .x_grid_spacer(CustomAxesDemo::x_grid)
+            .x_grid_spacer(Self::x_grid)
             .label_formatter(label_fmt)
             .show(ui, |plot_ui| {
-                plot_ui.line(CustomAxesDemo::logistic_fn());
+                plot_ui.line(Self::logistic_fn());
             })
             .response
     }
@@ -637,11 +638,11 @@ impl LinkedAxesDemo {
     }
 
     fn configure_plot(plot_ui: &mut egui_plot::PlotUi) {
-        plot_ui.line(LinkedAxesDemo::line_with_slope(0.5));
-        plot_ui.line(LinkedAxesDemo::line_with_slope(1.0));
-        plot_ui.line(LinkedAxesDemo::line_with_slope(2.0));
-        plot_ui.line(LinkedAxesDemo::sin());
-        plot_ui.line(LinkedAxesDemo::cos());
+        plot_ui.line(Self::line_with_slope(0.5));
+        plot_ui.line(Self::line_with_slope(1.0));
+        plot_ui.line(Self::line_with_slope(2.0));
+        plot_ui.line(Self::sin());
+        plot_ui.line(Self::cos());
     }
 
     fn ui(&mut self, ui: &mut Ui) -> Response {
@@ -664,17 +665,16 @@ impl LinkedAxesDemo {
                 .height(250.0)
                 .link_axis(link_group_id, self.link_x, self.link_y)
                 .link_cursor(link_group_id, self.link_cursor_x, self.link_cursor_y)
-                .show(ui, LinkedAxesDemo::configure_plot);
+                .show(ui, Self::configure_plot);
             Plot::new("right-top")
                 .data_aspect(2.0)
                 .width(150.0)
                 .height(250.0)
-                .y_axis_width(3)
                 .y_axis_label("y")
                 .y_axis_position(egui_plot::HPlacement::Right)
                 .link_axis(link_group_id, self.link_x, self.link_y)
                 .link_cursor(link_group_id, self.link_cursor_x, self.link_cursor_y)
-                .show(ui, LinkedAxesDemo::configure_plot);
+                .show(ui, Self::configure_plot);
         });
         Plot::new("left-bottom")
             .data_aspect(0.5)
@@ -683,7 +683,7 @@ impl LinkedAxesDemo {
             .x_axis_label("x")
             .link_axis(link_group_id, self.link_x, self.link_y)
             .link_cursor(link_group_id, self.link_cursor_x, self.link_cursor_y)
-            .show(ui, LinkedAxesDemo::configure_plot)
+            .show(ui, Self::configure_plot)
             .response
     }
 }
@@ -769,13 +769,46 @@ struct InteractionDemo {}
 impl InteractionDemo {
     #[allow(clippy::unused_self)]
     fn ui(&mut self, ui: &mut Ui) -> Response {
-        let plot = Plot::new("interaction_demo").height(300.0);
+        let id = ui.make_persistent_id("interaction_demo");
+
+        // This demonstrates how to read info about the plot _before_ showing it:
+        let plot_memory = egui_plot::PlotMemory::load(ui.ctx(), id);
+        if let Some(plot_memory) = plot_memory {
+            let bounds = plot_memory.bounds();
+            ui.label(format!(
+                "plot bounds: min: {:.02?}, max: {:.02?}",
+                bounds.min(),
+                bounds.max()
+            ));
+        }
+
+        let plot = Plot::new("interaction_demo").id(id).height(300.0);
 
         let PlotResponse {
             response,
             inner: (screen_pos, pointer_coordinate, pointer_coordinate_drag_delta, bounds, hovered),
+            hovered_plot_item,
             ..
         } = plot.show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new(PlotPoints::from_explicit_callback(
+                    move |x| x.sin(),
+                    ..,
+                    100,
+                ))
+                .color(Color32::RED)
+                .id(egui::Id::new("sin")),
+            );
+            plot_ui.line(
+                Line::new(PlotPoints::from_explicit_callback(
+                    move |x| x.cos(),
+                    ..,
+                    100,
+                ))
+                .color(Color32::BLUE)
+                .id(egui::Id::new("cos")),
+            );
+
             (
                 plot_ui.screen_from_plot(PlotPoint::new(0.0, 0.0)),
                 plot_ui.pointer_coordinate(),
@@ -807,6 +840,15 @@ impl InteractionDemo {
         );
         ui.label(format!("pointer coordinate drag delta: {coordinate_text}"));
 
+        let hovered_item = if hovered_plot_item == Some(egui::Id::new("sin")) {
+            "red sin"
+        } else if hovered_plot_item == Some(egui::Id::new("cos")) {
+            "blue cos"
+        } else {
+            "none"
+        };
+        ui.label(format!("hovered plot item: {hovered_item}"));
+
         response
     }
 }
@@ -830,8 +872,9 @@ impl Default for Chart {
 struct ChartsDemo {
     chart: Chart,
     vertical: bool,
-    allow_zoom: AxisBools,
-    allow_drag: AxisBools,
+    allow_zoom: Vec2b,
+    allow_drag: Vec2b,
+    allow_scroll: Vec2b,
 }
 
 impl Default for ChartsDemo {
@@ -841,6 +884,7 @@ impl Default for ChartsDemo {
             chart: Chart::default(),
             allow_zoom: true.into(),
             allow_drag: true.into(),
+            allow_scroll: true.into(),
         }
     }
 }
@@ -874,6 +918,11 @@ impl ChartsDemo {
                         ui.label("Allow drag:");
                         ui.checkbox(&mut self.allow_drag.x, "X");
                         ui.checkbox(&mut self.allow_drag.y, "Y");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Allow scroll:");
+                        ui.checkbox(&mut self.allow_scroll.x, "X");
+                        ui.checkbox(&mut self.allow_scroll.y, "Y");
                     });
                 });
             });
@@ -909,9 +958,9 @@ impl ChartsDemo {
         Plot::new("Normal Distribution Demo")
             .legend(Legend::default())
             .clamp_grid(true)
-            .y_axis_width(3)
             .allow_zoom(self.allow_zoom)
             .allow_drag(self.allow_drag)
+            .allow_scroll(self.allow_scroll)
             .show(ui, |plot_ui| plot_ui.bar_chart(chart))
             .response
     }

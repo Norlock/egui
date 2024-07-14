@@ -3,29 +3,19 @@
 //! Turn on the `syntect` feature for great syntax highlighting of any language.
 //! Otherwise, a very simple fallback will be used, that works okish for C, C++, Rust, and Python.
 
+#![allow(clippy::mem_forget)] // False positive from enum_map macro
+
 use egui::text::LayoutJob;
 
 /// View some code with syntax highlighting and selection.
 pub fn code_view_ui(
     ui: &mut egui::Ui,
     theme: &CodeTheme,
-    mut code: &str,
+    code: &str,
     language: &str,
 ) -> egui::Response {
-    let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
-        let layout_job = highlight(ui.ctx(), theme, string, language);
-        // layout_job.wrap.max_width = wrap_width; // no wrapping
-        ui.fonts(|f| f.layout_job(layout_job))
-    };
-
-    ui.add(
-        egui::TextEdit::multiline(&mut code)
-            .font(egui::TextStyle::Monospace) // for cursor height
-            .code_editor()
-            .desired_rows(1)
-            .lock_focus(true)
-            .layouter(&mut layouter),
-    )
+    let layout_job = highlight(ui.ctx(), theme, code, language);
+    ui.add(egui::Label::new(layout_job).selectable(true))
 }
 
 /// Add syntax highlighting to a code string.
@@ -50,7 +40,8 @@ pub fn highlight(ctx: &egui::Context, theme: &CodeTheme, code: &str, language: &
 // ----------------------------------------------------------------------------
 
 #[cfg(not(feature = "syntect"))]
-#[derive(Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize, enum_map::Enum)]
+#[derive(Clone, Copy, PartialEq, enum_map::Enum)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 enum TokenType {
     Comment,
     Keyword,
@@ -61,7 +52,8 @@ enum TokenType {
 }
 
 #[cfg(feature = "syntect")]
-#[derive(Clone, Copy, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 enum SyntectTheme {
     Base16EightiesDark,
     Base16MochaDark,
@@ -125,8 +117,12 @@ impl SyntectTheme {
 }
 
 /// A selected color theme.
-#[derive(Clone, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
-#[serde(default)]
+#[derive(Clone, Hash, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize, serde::Serialize),
+    serde(default)
+)]
 pub struct CodeTheme {
     dark_mode: bool,
 
@@ -160,12 +156,12 @@ impl CodeTheme {
         if ctx.style().visuals.dark_mode {
             ctx.data_mut(|d| {
                 d.get_persisted(egui::Id::new("dark"))
-                    .unwrap_or_else(CodeTheme::dark)
+                    .unwrap_or_else(Self::dark)
             })
         } else {
             ctx.data_mut(|d| {
                 d.get_persisted(egui::Id::new("light"))
-                    .unwrap_or_else(CodeTheme::light)
+                    .unwrap_or_else(Self::light)
             })
         }
     }
@@ -248,7 +244,7 @@ impl CodeTheme {
     /// Show UI for changing the color theme.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_top(|ui| {
-            let selected_id = egui::Id::null();
+            let selected_id = egui::Id::NULL;
             let mut selected_tt: TokenType =
                 ui.data_mut(|d| *d.get_persisted_mut_or(selected_id, TokenType::Comment));
 
@@ -277,9 +273,9 @@ impl CodeTheme {
                 });
 
                 let reset_value = if self.dark_mode {
-                    CodeTheme::dark()
+                    Self::dark()
                 } else {
-                    CodeTheme::light()
+                    Self::light()
                 };
 
                 if ui

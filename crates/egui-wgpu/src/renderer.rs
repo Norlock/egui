@@ -2,17 +2,19 @@
 
 use std::{borrow::Cow, num::NonZeroU64, ops::Range};
 
-use epaint::{ahash::HashMap, emath::NumExt, PaintCallbackInfo, Primitive, Vertex};
+use ahash::HashMap;
+use epaint::{emath::NumExt, PaintCallbackInfo, Primitive, Vertex};
 
-use wgpu;
 use wgpu::util::DeviceExt as _;
 
-// Only implements Send + Sync on wasm32 in order to allow storing wgpu resources on the type map.
-#[cfg(not(target_arch = "wasm32"))]
+/// You can use this for storage when implementing [`CallbackTrait`].
 pub type CallbackResources = type_map::concurrent::TypeMap;
-#[cfg(target_arch = "wasm32")]
-pub type CallbackResources = type_map::TypeMap;
 
+/// You can use this to do custom [`wgpu`] rendering in an egui app.
+///
+/// Implement [`CallbackTrait`] and call [`Callback::new_paint_callback`].
+///
+/// This can be turned into a [`epaint::PaintCallback`] and [`epaint::Shape`].
 pub struct Callback(Box<dyn CallbackTrait>);
 
 impl Callback {
@@ -48,7 +50,7 @@ impl Callback {
 ///
 /// ## Command Encoder
 ///
-/// The passed-in `CommandEncoder` is egui's and can be used directly to register
+/// The passed-in [`wgpu::CommandEncoder`] is egui's and can be used directly to register
 /// wgpu commands for simple use cases.
 /// This allows reusing the same [`wgpu::CommandEncoder`] for all callbacks and egui
 /// rendering itself.
@@ -56,7 +58,7 @@ impl Callback {
 /// ## Command Buffers
 ///
 /// For more complicated use cases, one can also return a list of arbitrary
-/// `CommandBuffer`s and have complete control over how they get created and fed.
+/// [`wgpu::CommandBuffer`]s and have complete control over how they get created and fed.
 /// In particular, this gives an opportunity to parallelize command registration and
 /// prevents a faulty callback from poisoning the main wgpu pipeline.
 ///
@@ -77,6 +79,7 @@ pub trait CallbackTrait: Send + Sync {
         &self,
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
+        _screen_descriptor: &ScreenDescriptor,
         _egui_encoder: &mut wgpu::CommandEncoder,
         _callback_resources: &mut CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -130,14 +133,16 @@ impl ScreenDescriptor {
 #[repr(C)]
 struct UniformBuffer {
     screen_size_in_points: [f32; 2],
+    dithering: u32,
     // Uniform buffers need to be at least 16 bytes in WebGL.
     // See https://github.com/gfx-rs/wgpu/issues/2072
-    _padding: [u32; 2],
+    _padding: u32,
 }
 
 impl PartialEq for UniformBuffer {
     fn eq(&self, other: &Self) -> bool {
         self.screen_size_in_points == other.screen_size_in_points
+            && self.dithering == other.dithering
     }
 }
 
@@ -160,11 +165,13 @@ pub struct Renderer {
     texture_bind_group_layout: wgpu::BindGroupLayout,
 
     /// Map of egui texture IDs to textures and their associated bindgroups (texture view +
-    /// sampler). The texture may be None if the TextureId is just a handle to a user-provided
+    /// sampler). The texture may be None if the `TextureId` is just a handle to a user-provided
     /// sampler.
     textures: HashMap<epaint::TextureId, (Option<wgpu::Texture>, wgpu::BindGroup)>,
     next_user_texture_id: u64,
     samplers: HashMap<epaint::textures::TextureOptions, wgpu::Sampler>,
+
+    dithering: bool,
 
     /// Storage for resources shared with all invocations of [`CallbackTrait`]'s methods.
     ///
@@ -182,6 +189,7 @@ impl Renderer {
         output_color_format: wgpu::TextureFormat,
         output_depth_format: Option<wgpu::TextureFormat>,
         msaa_samples: u32,
+        dithering: bool,
     ) -> Self {
         crate::profile_function!();
 
@@ -189,23 +197,28 @@ impl Renderer {
             label: Some("egui"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("egui.wgsl"))),
         };
-        let module = device.create_shader_module(shader);
+        let module = {
+            crate::profile_scope!("create_shader_module");
+            device.create_shader_module(shader)
+        };
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("egui_uniform_buffer"),
             contents: bytemuck::cast_slice(&[UniformBuffer {
                 screen_size_in_points: [0.0, 0.0],
+                dithering: u32::from(dithering),
                 _padding: Default::default(),
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bind_group_layout =
+        let uniform_bind_group_layout = {
+            crate::profile_scope!("create_bind_group_layout");
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("egui_uniform_bind_group_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         has_dynamic_offset: false,
                         min_binding_size: NonZeroU64::new(std::mem::size_of::<UniformBuffer>() as _),
@@ -213,22 +226,27 @@ impl Renderer {
                     },
                     count: None,
                 }],
-            });
+            })
+        };
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_uniform_bind_group"),
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &uniform_buffer,
-                    offset: 0,
-                    size: None,
-                }),
-            }],
-        });
+        let uniform_bind_group = {
+            crate::profile_scope!("create_bind_group");
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("egui_uniform_bind_group"),
+                layout: &uniform_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &uniform_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                }],
+            })
+        };
 
-        let texture_bind_group_layout =
+        let texture_bind_group_layout = {
+            crate::profile_scope!("create_bind_group_layout");
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("egui_texture_bind_group_layout"),
                 entries: &[
@@ -249,7 +267,8 @@ impl Renderer {
                         count: None,
                     },
                 ],
-            });
+            })
+        };
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("egui_pipeline_layout"),
@@ -265,64 +284,70 @@ impl Renderer {
             bias: wgpu::DepthBiasState::default(),
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("egui_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                entry_point: "vs_main",
-                module: &module,
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 5 * 4,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    // 0: vec2 position
-                    // 1: vec2 texture coordinates
-                    // 2: uint color
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                unclipped_depth: false,
-                conservative: false,
-                cull_mode: None,
-                front_face: wgpu::FrontFace::default(),
-                polygon_mode: wgpu::PolygonMode::default(),
-                strip_index_format: None,
-            },
-            depth_stencil,
-            multisample: wgpu::MultisampleState {
-                alpha_to_coverage_enabled: false,
-                count: msaa_samples,
-                mask: !0,
-            },
-
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: if output_color_format.is_srgb() {
-                    log::warn!("Detected a linear (sRGBA aware) framebuffer {:?}. egui prefers Rgba8Unorm or Bgra8Unorm", output_color_format);
-                    "fs_main_linear_framebuffer"
-                } else {
-                    "fs_main_gamma_framebuffer" // this is what we prefer
+        let pipeline = {
+            crate::profile_scope!("create_render_pipeline");
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("egui_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    entry_point: "vs_main",
+                    module: &module,
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: 5 * 4,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        // 0: vec2 position
+                        // 1: vec2 texture coordinates
+                        // 2: uint color
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
+                    }],
+                    compilation_options: wgpu::PipelineCompilationOptions::default()
                 },
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: output_color_format,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-        });
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    unclipped_depth: false,
+                    conservative: false,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::default(),
+                    polygon_mode: wgpu::PolygonMode::default(),
+                    strip_index_format: None,
+                },
+                depth_stencil,
+                multisample: wgpu::MultisampleState {
+                    alpha_to_coverage_enabled: false,
+                    count: msaa_samples,
+                    mask: !0,
+                },
+
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: if output_color_format.is_srgb() {
+                        log::warn!("Detected a linear (sRGBA aware) framebuffer {:?}. egui prefers Rgba8Unorm or Bgra8Unorm", output_color_format);
+                        "fs_main_linear_framebuffer"
+                    } else {
+                        "fs_main_gamma_framebuffer" // this is what we prefer
+                    },
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: output_color_format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::OneMinusDstAlpha,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default()
+                }),
+                multiview: None,
+            }
+        )
+        };
 
         const VERTEX_BUFFER_START_CAPACITY: wgpu::BufferAddress =
             (std::mem::size_of::<Vertex>() * 1024) as _;
@@ -345,13 +370,15 @@ impl Renderer {
             // Buffers on wgpu are zero initialized, so this is indeed its current state!
             previous_uniform_buffer_content: UniformBuffer {
                 screen_size_in_points: [0.0, 0.0],
-                _padding: [0, 0],
+                dithering: 0,
+                _padding: 0,
             },
             uniform_bind_group,
             texture_bind_group_layout,
             textures: HashMap::default(),
             next_user_texture_id: 0,
             samplers: HashMap::default(),
+            dithering,
             callback_resources: CallbackResources::default(),
         }
     }
@@ -440,39 +467,35 @@ impl Renderer {
                         continue;
                     };
 
-                    if callback.rect.is_positive() {
+                    let info = PaintCallbackInfo {
+                        viewport: callback.rect,
+                        clip_rect: *clip_rect,
+                        pixels_per_point,
+                        screen_size_px: size_in_pixels,
+                    };
+
+                    let viewport_px = info.viewport_in_pixels();
+                    if viewport_px.width_px > 0 && viewport_px.height_px > 0 {
                         crate::profile_scope!("callback");
 
                         needs_reset = true;
 
-                        let info = PaintCallbackInfo {
-                            viewport: callback.rect,
-                            clip_rect: *clip_rect,
-                            pixels_per_point,
-                            screen_size_px: size_in_pixels,
-                        };
-
-                        {
-                            // We're setting a default viewport for the render pass as a
-                            // courtesy for the user, so that they don't have to think about
-                            // it in the simple case where they just want to fill the whole
-                            // paint area.
-                            //
-                            // The user still has the possibility of setting their own custom
-                            // viewport during the paint callback, effectively overriding this
-                            // one.
-
-                            let viewport_px = info.viewport_in_pixels();
-
-                            render_pass.set_viewport(
-                                viewport_px.left_px,
-                                viewport_px.top_px,
-                                viewport_px.width_px,
-                                viewport_px.height_px,
-                                0.0,
-                                1.0,
-                            );
-                        }
+                        // We're setting a default viewport for the render pass as a
+                        // courtesy for the user, so that they don't have to think about
+                        // it in the simple case where they just want to fill the whole
+                        // paint area.
+                        //
+                        // The user still has the possibility of setting their own custom
+                        // viewport during the paint callback, effectively overriding this
+                        // one.
+                        render_pass.set_viewport(
+                            viewport_px.left_px as f32,
+                            viewport_px.top_px as f32,
+                            viewport_px.width_px as f32,
+                            viewport_px.height_px as f32,
+                            0.0,
+                            1.0,
+                        );
 
                         cbfn.0.paint(info, render_pass, &self.callback_resources);
                     }
@@ -483,7 +506,7 @@ impl Renderer {
         render_pass.set_scissor_rect(0, 0, size_in_pixels[0], size_in_pixels[1]);
     }
 
-    /// Should be called before `render()`.
+    /// Should be called before [`Self::render`].
     pub fn update_texture(
         &mut self,
         device: &wgpu::Device,
@@ -517,12 +540,14 @@ impl Renderer {
                     image.pixels.len(),
                     "Mismatch between texture size and texel count"
                 );
-                Cow::Owned(image.srgba_pixels(None).collect::<Vec<_>>())
+                crate::profile_scope!("font -> sRGBA");
+                Cow::Owned(image.srgba_pixels(None).collect::<Vec<egui::Color32>>())
             }
         };
         let data_bytes: &[u8] = bytemuck::cast_slice(data_color32.as_slice());
 
         let queue_write_data_to_texture = |texture, origin| {
+            crate::profile_scope!("write_texture");
             queue.write_texture(
                 wgpu::ImageCopyTexture {
                     texture,
@@ -560,16 +585,19 @@ impl Renderer {
             // Use same label for all resources associated with this texture id (no point in retyping the type)
             let label_str = format!("egui_texid_{id:?}");
             let label = Some(label_str.as_str());
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb, // Minspec for wgpu WebGL emulation is WebGL2, so this should always be supported.
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-            });
+            let texture = {
+                crate::profile_scope!("create_texture");
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label,
+                    size,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb, // Minspec for wgpu WebGL emulation is WebGL2, so this should always be supported.
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+                })
+            };
             let sampler = self
                 .samplers
                 .entry(image_delta.options)
@@ -611,12 +639,11 @@ impl Renderer {
         self.textures.get(id)
     }
 
-    /// Registers a `wgpu::Texture` with a `epaint::TextureId`.
+    /// Registers a [`wgpu::Texture`] with a [`epaint::TextureId`].
     ///
     /// This enables the application to reference the texture inside an image ui element.
     /// This effectively enables off-screen rendering inside the egui UI. Texture must have
-    /// the texture format `TextureFormat::Rgba8UnormSrgb` and
-    /// Texture usage `TextureUsage::SAMPLED`.
+    /// the texture format [`wgpu::TextureFormat::Rgba8UnormSrgb`].
     pub fn register_native_texture(
         &mut self,
         device: &wgpu::Device,
@@ -635,9 +662,9 @@ impl Renderer {
         )
     }
 
-    /// Registers a `wgpu::Texture` with an existing `epaint::TextureId`.
+    /// Registers a [`wgpu::Texture`] with an existing [`epaint::TextureId`].
     ///
-    /// This enables applications to reuse `TextureId`s.
+    /// This enables applications to reuse [`epaint::TextureId`]s.
     pub fn update_egui_texture_from_wgpu_texture(
         &mut self,
         device: &wgpu::Device,
@@ -658,15 +685,14 @@ impl Renderer {
         );
     }
 
-    /// Registers a `wgpu::Texture` with a `epaint::TextureId` while also accepting custom
-    /// `wgpu::SamplerDescriptor` options.
+    /// Registers a [`wgpu::Texture`] with a [`epaint::TextureId`] while also accepting custom
+    /// [`wgpu::SamplerDescriptor`] options.
     ///
     /// This allows applications to specify individual minification/magnification filters as well as
     /// custom mipmap and tiling options.
     ///
-    /// The `Texture` must have the format `TextureFormat::Rgba8UnormSrgb` and usage
-    /// `TextureUsage::SAMPLED`. Any compare function supplied in the `SamplerDescriptor` will be
-    /// ignored.
+    /// The texture must have the format [`wgpu::TextureFormat::Rgba8UnormSrgb`].
+    /// Any compare function supplied in the [`wgpu::SamplerDescriptor`] will be ignored.
     #[allow(clippy::needless_pass_by_value)] // false positive
     pub fn register_native_texture_with_sampler_options(
         &mut self,
@@ -703,10 +729,10 @@ impl Renderer {
         id
     }
 
-    /// Registers a `wgpu::Texture` with an existing `epaint::TextureId` while also accepting custom
-    /// `wgpu::SamplerDescriptor` options.
+    /// Registers a [`wgpu::Texture`] with an existing [`epaint::TextureId`] while also accepting custom
+    /// [`wgpu::SamplerDescriptor`] options.
     ///
-    /// This allows applications to reuse `TextureId`s created with custom sampler options.
+    /// This allows applications to reuse [`epaint::TextureId`]s created with custom sampler options.
     #[allow(clippy::needless_pass_by_value)] // false positive
     pub fn update_egui_texture_from_wgpu_texture_with_sampler_options(
         &mut self,
@@ -746,7 +772,7 @@ impl Renderer {
     }
 
     /// Uploads the uniform, vertex and index data used by the renderer.
-    /// Should be called before `render()`.
+    /// Should be called before [`Self::render`].
     ///
     /// Returns all user-defined command buffers gathered from [`CallbackTrait::prepare`] & [`CallbackTrait::finish_prepare`] callbacks.
     pub fn update_buffers(
@@ -763,6 +789,7 @@ impl Renderer {
 
         let uniform_buffer_content = UniformBuffer {
             screen_size_in_points,
+            dithering: u32::from(self.dithering),
             _padding: Default::default(),
         };
         if uniform_buffer_content != self.previous_uniform_buffer_content {
@@ -797,9 +824,10 @@ impl Renderer {
         };
 
         if index_count > 0 {
-            crate::profile_scope!("indices");
+            crate::profile_scope!("indices", index_count.to_string());
 
             self.index_buffer.slices.clear();
+
             let required_index_buffer_size = (std::mem::size_of::<u32>() * index_count) as u64;
             if self.index_buffer.capacity < required_index_buffer_size {
                 // Resize index buffer if needed.
@@ -808,13 +836,16 @@ impl Renderer {
                 self.index_buffer.buffer = create_index_buffer(device, self.index_buffer.capacity);
             }
 
-            let mut index_buffer_staging = queue
-                .write_buffer_with(
-                    &self.index_buffer.buffer,
-                    0,
-                    NonZeroU64::new(required_index_buffer_size).unwrap(),
-                )
-                .expect("Failed to create staging buffer for index data");
+            let index_buffer_staging = queue.write_buffer_with(
+                &self.index_buffer.buffer,
+                0,
+                NonZeroU64::new(required_index_buffer_size).unwrap(),
+            );
+
+            let Some(mut index_buffer_staging) = index_buffer_staging else {
+                panic!("Failed to create staging buffer for index data. Index count: {index_count}. Required index buffer size: {required_index_buffer_size}. Actual size {} and capacity: {} (bytes)", self.index_buffer.buffer.size(), self.index_buffer.capacity);
+            };
+
             let mut index_offset = 0;
             for epaint::ClippedPrimitive { primitive, .. } in paint_jobs {
                 match primitive {
@@ -831,9 +862,10 @@ impl Renderer {
             }
         }
         if vertex_count > 0 {
-            crate::profile_scope!("vertices");
+            crate::profile_scope!("vertices", vertex_count.to_string());
 
             self.vertex_buffer.slices.clear();
+
             let required_vertex_buffer_size = (std::mem::size_of::<Vertex>() * vertex_count) as u64;
             if self.vertex_buffer.capacity < required_vertex_buffer_size {
                 // Resize vertex buffer if needed.
@@ -843,13 +875,16 @@ impl Renderer {
                     create_vertex_buffer(device, self.vertex_buffer.capacity);
             }
 
-            let mut vertex_buffer_staging = queue
-                .write_buffer_with(
-                    &self.vertex_buffer.buffer,
-                    0,
-                    NonZeroU64::new(required_vertex_buffer_size).unwrap(),
-                )
-                .expect("Failed to create staging buffer for vertex data");
+            let vertex_buffer_staging = queue.write_buffer_with(
+                &self.vertex_buffer.buffer,
+                0,
+                NonZeroU64::new(required_vertex_buffer_size).unwrap(),
+            );
+
+            let Some(mut vertex_buffer_staging) = vertex_buffer_staging else {
+                panic!("Failed to create staging buffer for vertex data. Vertex count: {vertex_count}. Required vertex buffer size: {required_vertex_buffer_size}. Actual size {} and capacity: {} (bytes)", self.vertex_buffer.buffer.size(), self.vertex_buffer.capacity);
+            };
+
             let mut vertex_offset = 0;
             for epaint::ClippedPrimitive { primitive, .. } in paint_jobs {
                 match primitive {
@@ -873,6 +908,7 @@ impl Renderer {
                 user_cmd_bufs.extend(callback.prepare(
                     device,
                     queue,
+                    screen_descriptor,
                     encoder,
                     &mut self.callback_resources,
                 ));
@@ -906,12 +942,19 @@ fn create_sampler(
         epaint::textures::TextureFilter::Nearest => wgpu::FilterMode::Nearest,
         epaint::textures::TextureFilter::Linear => wgpu::FilterMode::Linear,
     };
+    let address_mode = match options.wrap_mode {
+        epaint::textures::TextureWrapMode::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+        epaint::textures::TextureWrapMode::Repeat => wgpu::AddressMode::Repeat,
+        epaint::textures::TextureWrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
+    };
     device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some(&format!(
             "egui sampler (mag: {mag_filter:?}, min {min_filter:?})"
         )),
         mag_filter,
         min_filter,
+        address_mode_u: address_mode,
+        address_mode_v: address_mode,
         ..Default::default()
     })
 }
@@ -973,9 +1016,6 @@ impl ScissorRect {
     }
 }
 
-// Wgpu objects contain references to the JS heap on the web, therefore they are not Send/Sync.
-// It follows that egui_wgpu::Renderer can not be Send/Sync either when building with wasm.
-#[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn renderer_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}

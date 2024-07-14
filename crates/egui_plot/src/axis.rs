@@ -1,22 +1,23 @@
 use std::{fmt::Debug, ops::RangeInclusive, sync::Arc};
 
-use egui::emath::{remap_clamp, round_to_decimals, Pos2, Rect};
-use egui::epaint::{Shape, Stroke, TextShape};
-
-use crate::{Response, Sense, TextStyle, Ui, WidgetText};
+use egui::{
+    emath::{remap_clamp, Rot2},
+    epaint::TextShape,
+    Pos2, Rangef, Rect, Response, Sense, TextStyle, TextWrapMode, Ui, Vec2, WidgetText,
+};
 
 use super::{transform::PlotTransform, GridMark};
 
-pub(super) type AxisFormatterFn = dyn Fn(f64, usize, &RangeInclusive<f64>) -> String;
+pub(super) type AxisFormatterFn<'a> = dyn Fn(GridMark, &RangeInclusive<f64>) -> String + 'a;
 
 /// X or Y axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
     /// Horizontal X-Axis
-    X,
+    X = 0,
 
     /// Vertical Y-axis
-    Y,
+    Y = 1,
 }
 
 impl From<Axis> for usize {
@@ -57,8 +58,18 @@ impl From<HPlacement> for Placement {
     #[inline]
     fn from(placement: HPlacement) -> Self {
         match placement {
-            HPlacement::Left => Placement::LeftBottom,
-            HPlacement::Right => Placement::RightTop,
+            HPlacement::Left => Self::LeftBottom,
+            HPlacement::Right => Self::RightTop,
+        }
+    }
+}
+
+impl From<Placement> for HPlacement {
+    #[inline]
+    fn from(placement: Placement) -> Self {
+        match placement {
+            Placement::LeftBottom => Self::Left,
+            Placement::RightTop => Self::Right,
         }
     }
 }
@@ -67,8 +78,18 @@ impl From<VPlacement> for Placement {
     #[inline]
     fn from(placement: VPlacement) -> Self {
         match placement {
-            VPlacement::Top => Placement::RightTop,
-            VPlacement::Bottom => Placement::LeftBottom,
+            VPlacement::Top => Self::RightTop,
+            VPlacement::Bottom => Self::LeftBottom,
+        }
+    }
+}
+
+impl From<Placement> for VPlacement {
+    #[inline]
+    fn from(placement: Placement) -> Self {
+        match placement {
+            Placement::LeftBottom => Self::Bottom,
+            Placement::RightTop => Self::Top,
         }
     }
 }
@@ -77,115 +98,142 @@ impl From<VPlacement> for Placement {
 ///
 /// Used to configure axis label and ticks.
 #[derive(Clone)]
-pub struct AxisHints {
+pub struct AxisHints<'a> {
     pub(super) label: WidgetText,
-    pub(super) formatter: Arc<AxisFormatterFn>,
-    pub(super) digits: usize,
+    pub(super) formatter: Arc<AxisFormatterFn<'a>>,
+    pub(super) min_thickness: f32,
     pub(super) placement: Placement,
+    pub(super) label_spacing: Rangef,
 }
 
-// TODO: this just a guess. It might cease to work if a user changes font size.
+// TODO(JohannesProgrammiert): this just a guess. It might cease to work if a user changes font size.
 const LINE_HEIGHT: f32 = 12.0;
 
-impl Default for AxisHints {
+impl<'a> AxisHints<'a> {
+    /// Initializes a default axis configuration for the X axis.
+    pub fn new_x() -> Self {
+        Self::new(Axis::X)
+    }
+
+    /// Initializes a default axis configuration for the Y axis.
+    pub fn new_y() -> Self {
+        Self::new(Axis::Y)
+    }
+
     /// Initializes a default axis configuration for the specified axis.
     ///
     /// `label` is empty.
     /// `formatter` is default float to string formatter.
-    /// maximum `digits` on tick label is 5.
-    fn default() -> Self {
+    pub fn new(axis: Axis) -> Self {
         Self {
             label: Default::default(),
             formatter: Arc::new(Self::default_formatter),
-            digits: 5,
+            min_thickness: 14.0,
             placement: Placement::LeftBottom,
+            label_spacing: match axis {
+                Axis::X => Rangef::new(60.0, 80.0), // labels can get pretty wide
+                Axis::Y => Rangef::new(20.0, 30.0), // text isn't very high
+            },
         }
     }
-}
 
-impl AxisHints {
     /// Specify custom formatter for ticks.
     ///
     /// The first parameter of `formatter` is the raw tick value as `f64`.
-    /// The second parameter is the maximum number of characters that fit into y-labels.
     /// The second parameter of `formatter` is the currently shown range on this axis.
     pub fn formatter(
         mut self,
-        fmt: impl Fn(f64, usize, &RangeInclusive<f64>) -> String + 'static,
+        fmt: impl Fn(GridMark, &RangeInclusive<f64>) -> String + 'a,
     ) -> Self {
         self.formatter = Arc::new(fmt);
         self
     }
 
-    fn default_formatter(tick: f64, max_digits: usize, _range: &RangeInclusive<f64>) -> String {
-        if tick.abs() > 10.0_f64.powf(max_digits as f64) {
-            let tick_rounded = tick as isize;
-            return format!("{tick_rounded:+e}");
-        }
-        let tick_rounded = round_to_decimals(tick, max_digits);
-        if tick.abs() < 10.0_f64.powf(-(max_digits as f64)) && tick != 0.0 {
-            return format!("{tick_rounded:+e}");
-        }
-        tick_rounded.to_string()
+    fn default_formatter(mark: GridMark, _range: &RangeInclusive<f64>) -> String {
+        // Example: If the step to the next tick is `0.01`, we should use 2 decimals of precision:
+        let num_decimals = -mark.step_size.log10().round() as usize;
+
+        emath::format_with_decimals_in_range(mark.value, num_decimals..=num_decimals)
     }
 
     /// Specify axis label.
     ///
     /// The default is 'x' for x-axes and 'y' for y-axes.
+    #[inline]
     pub fn label(mut self, label: impl Into<WidgetText>) -> Self {
         self.label = label.into();
         self
     }
 
-    /// Specify maximum number of digits for ticks.
-    ///
-    /// This is considered by the default tick formatter and affects the width of the y-axis
-    pub fn max_digits(mut self, digits: usize) -> Self {
-        self.digits = digits;
+    /// Specify minimum thickness of the axis
+    #[inline]
+    pub fn min_thickness(mut self, min_thickness: f32) -> Self {
+        self.min_thickness = min_thickness;
         self
+    }
+
+    /// Specify maximum number of digits for ticks.
+    #[inline]
+    #[deprecated = "Use `min_thickness` instead"]
+    pub fn max_digits(self, digits: usize) -> Self {
+        self.min_thickness(12.0 * digits as f32)
     }
 
     /// Specify the placement of the axis.
     ///
     /// For X-axis, use [`VPlacement`].
     /// For Y-axis, use [`HPlacement`].
+    #[inline]
     pub fn placement(mut self, placement: impl Into<Placement>) -> Self {
         self.placement = placement.into();
         self
     }
 
+    /// Set the minimum spacing between labels
+    ///
+    /// When labels get closer together than the given minimum, then they become invisible.
+    /// When they get further apart than the max, they are at full opacity.
+    ///
+    /// Labels can never be closer together than the [`crate::Plot::grid_spacing`] setting.
+    #[inline]
+    pub fn label_spacing(mut self, range: impl Into<Rangef>) -> Self {
+        self.label_spacing = range.into();
+        self
+    }
+
     pub(super) fn thickness(&self, axis: Axis) -> f32 {
         match axis {
-            Axis::X => {
-                if self.label.is_empty() {
-                    1.0 * LINE_HEIGHT
-                } else {
-                    3.0 * LINE_HEIGHT
-                }
-            }
+            Axis::X => self.min_thickness.max(if self.label.is_empty() {
+                1.0 * LINE_HEIGHT
+            } else {
+                3.0 * LINE_HEIGHT
+            }),
             Axis::Y => {
-                if self.label.is_empty() {
-                    (self.digits as f32) * LINE_HEIGHT
-                } else {
-                    (self.digits as f32 + 1.0) * LINE_HEIGHT
-                }
+                self.min_thickness
+                    + if self.label.is_empty() {
+                        0.0
+                    } else {
+                        LINE_HEIGHT
+                    }
             }
         }
     }
 }
 
 #[derive(Clone)]
-pub(super) struct AxisWidget {
-    pub(super) range: RangeInclusive<f64>,
-    pub(super) hints: AxisHints,
-    pub(super) rect: Rect,
-    pub(super) transform: Option<PlotTransform>,
-    pub(super) steps: Arc<Vec<GridMark>>,
+pub(super) struct AxisWidget<'a> {
+    pub range: RangeInclusive<f64>,
+    pub hints: AxisHints<'a>,
+
+    /// The region where we draw the axis labels.
+    pub rect: Rect,
+    pub transform: Option<PlotTransform>,
+    pub steps: Arc<Vec<GridMark>>,
 }
 
-impl AxisWidget {
-    /// if `rect` as width or height == 0, is will be automatically calculated from ticks and text.
-    pub(super) fn new(hints: AxisHints, rect: Rect) -> Self {
+impl<'a> AxisWidget<'a> {
+    /// if `rect` has width or height == 0, it will be automatically calculated from ticks and text.
+    pub fn new(hints: AxisHints<'a>, rect: Rect) -> Self {
         Self {
             range: (0.0..=0.0),
             hints,
@@ -195,13 +243,24 @@ impl AxisWidget {
         }
     }
 
-    pub fn ui(self, ui: &mut Ui, axis: Axis) -> Response {
+    /// Returns the actual thickness of the axis.
+    pub fn ui(self, ui: &mut Ui, axis: Axis) -> (Response, f32) {
         let response = ui.allocate_rect(self.rect, Sense::hover());
 
-        if ui.is_rect_visible(response.rect) {
-            let visuals = ui.style().visuals.clone();
+        if !ui.is_rect_visible(response.rect) {
+            return (response, 0.0);
+        }
+
+        let visuals = ui.style().visuals.clone();
+
+        {
             let text = self.hints.label;
-            let galley = text.into_galley(ui, Some(false), f32::INFINITY, TextStyle::Body);
+            let galley = text.into_galley(
+                ui,
+                Some(TextWrapMode::Extend),
+                f32::INFINITY,
+                TextStyle::Body,
+            );
             let text_color = visuals
                 .override_text_color
                 .unwrap_or_else(|| ui.visuals().text_color());
@@ -244,75 +303,96 @@ impl AxisWidget {
                     }
                 },
             };
-            let shape = TextShape {
-                pos: text_pos,
-                galley: galley.galley,
-                underline: Stroke::NONE,
-                override_text_color: Some(text_color),
-                angle,
-            };
-            ui.painter().add(shape);
 
-            // --- add ticks ---
-            let font_id = TextStyle::Body.resolve(ui.style());
-            let Some(transform) = self.transform else {
-                return response;
-            };
+            ui.painter()
+                .add(TextShape::new(text_pos, galley, text_color).with_angle(angle));
+        }
 
-            for step in self.steps.iter() {
-                let text = (self.hints.formatter)(step.value, self.hints.digits, &self.range);
-                if !text.is_empty() {
-                    const MIN_TEXT_SPACING: f32 = 20.0;
-                    const FULL_CONTRAST_SPACING: f32 = 40.0;
-                    let spacing_in_points =
-                        (transform.dpos_dvalue()[usize::from(axis)] * step.step_size).abs() as f32;
+        let font_id = TextStyle::Body.resolve(ui.style());
+        let Some(transform) = self.transform else {
+            return (response, 0.0);
+        };
 
-                    if spacing_in_points <= MIN_TEXT_SPACING {
-                        continue;
-                    }
-                    let line_strength = remap_clamp(
-                        spacing_in_points,
-                        MIN_TEXT_SPACING..=FULL_CONTRAST_SPACING,
-                        0.0..=1.0,
-                    );
+        let label_spacing = self.hints.label_spacing;
 
-                    let line_color = super::color_from_strength(ui, line_strength);
-                    let galley = ui
-                        .painter()
-                        .layout_no_wrap(text, font_id.clone(), line_color);
+        let mut thickness: f32 = 0.0;
 
-                    let text_pos = match axis {
-                        Axis::X => {
-                            let y = match self.hints.placement {
-                                Placement::LeftBottom => self.rect.min.y,
-                                Placement::RightTop => self.rect.max.y - galley.size().y,
-                            };
-                            let projected_point = super::PlotPoint::new(step.value, 0.0);
-                            Pos2 {
-                                x: transform.position_from_point(&projected_point).x
-                                    - galley.size().x / 2.0,
-                                y,
-                            }
-                        }
-                        Axis::Y => {
-                            let x = match self.hints.placement {
-                                Placement::LeftBottom => self.rect.max.x - galley.size().x,
-                                Placement::RightTop => self.rect.min.x,
-                            };
-                            let projected_point = super::PlotPoint::new(0.0, step.value);
-                            Pos2 {
-                                x,
-                                y: transform.position_from_point(&projected_point).y
-                                    - galley.size().y / 2.0,
-                            }
-                        }
-                    };
+        // Add tick labels:
+        for step in self.steps.iter() {
+            let text = (self.hints.formatter)(*step, &self.range);
+            if !text.is_empty() {
+                let spacing_in_points =
+                    (transform.dpos_dvalue()[usize::from(axis)] * step.step_size).abs() as f32;
 
-                    ui.painter().add(Shape::galley(text_pos, galley));
+                if spacing_in_points <= label_spacing.min {
+                    // Labels are too close together - don't paint them.
+                    continue;
                 }
+
+                // Fade in labels as they get further apart:
+                let strength = remap_clamp(spacing_in_points, label_spacing, 0.0..=1.0);
+
+                let text_color = super::color_from_strength(ui, strength);
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(text, font_id.clone(), text_color);
+
+                if spacing_in_points < galley.size()[axis as usize] {
+                    continue; // the galley won't fit (likely too wide on the X axis).
+                }
+
+                match axis {
+                    Axis::X => {
+                        thickness = thickness.max(galley.size().y);
+
+                        let projected_point = super::PlotPoint::new(step.value, 0.0);
+                        let center_x = transform.position_from_point(&projected_point).x;
+                        let y = match VPlacement::from(self.hints.placement) {
+                            VPlacement::Bottom => self.rect.min.y,
+                            VPlacement::Top => self.rect.max.y - galley.size().y,
+                        };
+                        let pos = Pos2::new(center_x - galley.size().x / 2.0, y);
+                        ui.painter().add(TextShape::new(pos, galley, text_color));
+                    }
+                    Axis::Y => {
+                        thickness = thickness.max(galley.size().x);
+
+                        let projected_point = super::PlotPoint::new(0.0, step.value);
+                        let center_y = transform.position_from_point(&projected_point).y;
+
+                        match HPlacement::from(self.hints.placement) {
+                            HPlacement::Left => {
+                                let angle = 0.0; // TODO(emilk): allow users to rotate text
+
+                                if angle == 0.0 {
+                                    let x = self.rect.max.x - galley.size().x;
+                                    let pos = Pos2::new(x, center_y - galley.size().y / 2.0);
+                                    ui.painter().add(TextShape::new(pos, galley, text_color));
+                                } else {
+                                    let right = Pos2::new(
+                                        self.rect.max.x,
+                                        center_y - galley.size().y / 2.0,
+                                    );
+                                    let width = galley.size().x;
+                                    let left =
+                                        right - Rot2::from_angle(angle) * Vec2::new(width, 0.0);
+
+                                    ui.painter().add(
+                                        TextShape::new(left, galley, text_color).with_angle(angle),
+                                    );
+                                }
+                            }
+                            HPlacement::Right => {
+                                let x = self.rect.min.x;
+                                let pos = Pos2::new(x, center_y - galley.size().y / 2.0);
+                                ui.painter().add(TextShape::new(pos, galley, text_color));
+                            }
+                        };
+                    }
+                };
             }
         }
 
-        response
+        (response, thickness)
     }
 }

@@ -1,4 +1,4 @@
-use egui::{text_edit::CCursorRange, *};
+use egui::{text::CCursorRange, *};
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
@@ -45,10 +45,10 @@ impl EasyMarkEditor {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("controls").show(ui, |ui| {
-            let _ = ui.button("Hotkeys").on_hover_ui(nested_hotkeys_ui);
+            let _response = ui.button("Hotkeys").on_hover_ui(nested_hotkeys_ui);
             ui.checkbox(&mut self.show_rendered, "Show rendered");
             ui.checkbox(&mut self.highlight_editor, "Highlight editor");
-            egui::reset_button(ui, self);
+            egui::reset_button(ui, self, "Reset");
             ui.end_row();
         });
         ui.separator();
@@ -95,10 +95,10 @@ impl EasyMarkEditor {
         };
 
         if let Some(mut state) = TextEdit::load_state(ui.ctx(), response.id) {
-            if let Some(mut ccursor_range) = state.ccursor_range() {
+            if let Some(mut ccursor_range) = state.cursor.char_range() {
                 let any_change = shortcuts(ui, code, &mut ccursor_range);
                 if any_change {
-                    state.set_ccursor_range(Some(ccursor_range));
+                    state.cursor.set_char_range(Some(ccursor_range));
                     state.store(ui.ctx(), response.id);
                 }
             }
@@ -261,7 +261,7 @@ The style characters are chosen to be similar to what they are representing:
   `$` = $small$
   `^` = ^raised^
 
-# TODO
+# To do
 - Sub-headers (`## h2`, `### h3` etc)
 - Hotkey Editor
 - International keyboard algorithm for non-letter keys
@@ -277,5 +277,5 @@ The style characters are chosen to be similar to what they are representing:
   - `<url>` and `[url](url)` do the same thing yet look completely different.
   - let's keep similarity with images
 - Tables
-- Inspiration: <https://mycorrhiza.lesarbr.es/page/mycomarkup>
+- Inspiration: <https://mycorrhiza.wiki/help/en/mycomarkup>
 "#;

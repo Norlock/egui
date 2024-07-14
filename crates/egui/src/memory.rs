@@ -1,8 +1,12 @@
 #![warn(missing_docs)] // Let's keep this file well-documented.` to memory.rs
 
-use epaint::{emath::Rangef, vec2, Vec2};
+use ahash::{HashMap, HashSet};
+use epaint::emath::TSTransform;
 
-use crate::{area, window, EventFilter, Id, IdMap, InputState, LayerId, Pos2, Rect, Style};
+use crate::{
+    area, vec2, EventFilter, Id, IdMap, LayerId, Order, Pos2, Rangef, RawInput, Rect, Style, Vec2,
+    ViewportId, ViewportIdMap, ViewportIdSet,
+};
 
 // ----------------------------------------------------------------------------
 
@@ -15,7 +19,7 @@ use crate::{area, window, EventFilter, Id, IdMap, InputState, LayerId, Pos2, Rec
 /// For this you need to enable the `persistence`.
 ///
 /// If you want to store data for your widgets, you should look at [`Memory::data`]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "persistence", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "persistence", serde(default))]
 pub struct Memory {
@@ -34,7 +38,7 @@ pub struct Memory {
     ///
     /// This will be saved between different program runs if you use the `persistence` feature.
     ///
-    /// To store a state common for all your widgets (a singleton), use [`Id::null`] as the key.
+    /// To store a state common for all your widgets (a singleton), use [`Id::NULL`] as the key.
     pub data: crate::util::IdTypeMap,
 
     // ------------------------------------------
@@ -66,24 +70,13 @@ pub struct Memory {
     pub caches: crate::util::cache::CacheStorage,
 
     // ------------------------------------------
-    /// new scale that will be applied at the start of the next frame
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) new_pixels_per_point: Option<f32>,
-
     /// new fonts that will be applied at the start of the next frame
     #[cfg_attr(feature = "persistence", serde(skip))]
     pub(crate) new_font_definitions: Option<epaint::text::FontDefinitions>,
 
+    // Current active viewport
     #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) interaction: Interaction,
-
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) window_interaction: Option<window::WindowInteraction>,
-
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    pub(crate) drag_value: crate::widgets::drag_value::MonoState,
-
-    pub(crate) areas: Areas,
+    pub(crate) viewport_id: ViewportId,
 
     /// Which popup-window is open (if any)?
     /// Could be a combo box, color picker, menu etc.
@@ -92,6 +85,40 @@ pub struct Memory {
 
     #[cfg_attr(feature = "persistence", serde(skip))]
     everything_is_visible: bool,
+
+    /// Transforms per layer
+    pub layer_transforms: HashMap<LayerId, TSTransform>,
+
+    // -------------------------------------------------
+    // Per-viewport:
+    areas: ViewportIdMap<Areas>,
+
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    pub(crate) interactions: ViewportIdMap<InteractionState>,
+
+    #[cfg_attr(feature = "persistence", serde(skip))]
+    pub(crate) focus: ViewportIdMap<Focus>,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        let mut slf = Self {
+            options: Default::default(),
+            data: Default::default(),
+            caches: Default::default(),
+            new_font_definitions: Default::default(),
+            interactions: Default::default(),
+            focus: Default::default(),
+            viewport_id: Default::default(),
+            areas: Default::default(),
+            layer_transforms: Default::default(),
+            popup: Default::default(),
+            everything_is_visible: Default::default(),
+        };
+        slf.interactions.entry(slf.viewport_id).or_default();
+        slf.areas.entry(slf.viewport_id).or_default();
+        slf
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,7 +132,7 @@ enum FocusDirection {
     /// Select the widget below the current focused widget.
     Down,
 
-    /// Select the widget to the left of the the current focused widget.
+    /// Select the widget to the left of the current focused widget.
     Left,
 
     /// Select the previous widget that had focus.
@@ -122,12 +149,9 @@ enum FocusDirection {
 impl FocusDirection {
     fn is_cardinal(&self) -> bool {
         match self {
-            FocusDirection::Up
-            | FocusDirection::Right
-            | FocusDirection::Down
-            | FocusDirection::Left => true,
+            Self::Up | Self::Right | Self::Down | Self::Left => true,
 
-            FocusDirection::Previous | FocusDirection::Next | FocusDirection::None => false,
+            Self::Previous | Self::Next | Self::None => false,
         }
     }
 }
@@ -135,7 +159,9 @@ impl FocusDirection {
 // ----------------------------------------------------------------------------
 
 /// Some global options that you can read and write.
-#[derive(Clone, Debug)]
+///
+/// See also [`crate::style::DebugOptions`].
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct Options {
@@ -143,8 +169,40 @@ pub struct Options {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) style: std::sync::Arc<Style>,
 
+    /// Global zoom factor of the UI.
+    ///
+    /// This is used to calculate the `pixels_per_point`
+    /// for the UI as `pixels_per_point = zoom_fator * native_pixels_per_point`.
+    ///
+    /// The default is 1.0.
+    /// Make larger to make everything larger.
+    ///
+    /// Please call [`crate::Context::set_zoom_factor`]
+    /// instead of modifying this directly!
+    pub zoom_factor: f32,
+
+    /// If `true`, egui will change the scale of the ui ([`crate::Context::zoom_factor`]) when the user
+    /// presses Cmd+Plus, Cmd+Minus or Cmd+0, just like in a browser.
+    ///
+    /// This is `true` by default.
+    ///
+    /// On the web-backend of `eframe` this is set to false by default,
+    /// so that the zoom shortcuts are handled exclusively by the browser,
+    /// which will change the `native_pixels_per_point` (`devicePixelRatio`).
+    /// You can still zoom egui independently by calling [`crate::Context::set_zoom_factor`],
+    /// which will be applied on top of the browsers global zoom.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub zoom_with_keyboard: bool,
+
     /// Controls the tessellator.
     pub tessellation_options: epaint::TessellationOptions,
+
+    /// If any widget moves or changes id, repaint everything.
+    ///
+    /// It is recommended you keep this OFF, because
+    /// it is know to cause endless repaints, for unknown reasons
+    /// (<https://github.com/rerun-io/rerun/issues/5018>).
+    pub repaint_on_widget_change: bool,
 
     /// This is a signal to any backend that we want the [`crate::PlatformOutput::events`] read out loud.
     ///
@@ -152,7 +210,7 @@ pub struct Options {
     ///
     /// Screen readers is an experimental feature of egui, and not supported on all platforms.
     ///
-    /// `eframe` supports it only on web, using the `web_screen_reader` feature flag,
+    /// `eframe` supports it only on web,
     /// but you should consider using [AccessKit](https://github.com/AccessKit/accesskit) instead,
     /// which `eframe` supports.
     pub screen_reader: bool,
@@ -169,22 +227,141 @@ pub struct Options {
     ///
     /// By default this is `true` in debug builds.
     pub warn_on_id_clash: bool,
+
+    // ------------------------------
+    // Input:
+    /// Multiplier for the scroll speed when reported in [`crate::MouseWheelUnit::Line`]s.
+    pub line_scroll_speed: f32,
+
+    /// Controls the speed at which we zoom in when doing ctrl/cmd + scroll.
+    pub scroll_zoom_speed: f32,
+
+    /// If `true`, `egui` will discard the loaded image data after
+    /// the texture is loaded onto the GPU to reduce memory usage.
+    ///
+    /// In modern GPU rendering, the texture data is not required after the texture is loaded.
+    ///
+    /// This is beneficial when using a large number or resolution of images and there is no need to
+    /// retain the image data, potentially saving a significant amount of memory.
+    ///
+    /// The drawback is that it becomes impossible to serialize the loaded images or render in non-GPU systems.
+    ///
+    /// Default is `false`.
+    pub reduce_texture_memory: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
+        // TODO(emilk): figure out why these constants need to be different on web and on native (winit).
+        let is_web = cfg!(target_arch = "wasm32");
+        let line_scroll_speed = if is_web {
+            8.0
+        } else {
+            40.0 // Scroll speed decided by consensus: https://github.com/emilk/egui/issues/461
+        };
+
         Self {
             style: Default::default(),
+            zoom_factor: 1.0,
+            zoom_with_keyboard: true,
             tessellation_options: Default::default(),
+            repaint_on_widget_change: false,
             screen_reader: false,
             preload_font_glyphs: true,
             warn_on_id_clash: cfg!(debug_assertions),
+
+            // Input:
+            line_scroll_speed,
+            scroll_zoom_speed: 1.0 / 200.0,
+            reduce_texture_memory: false,
         }
+    }
+}
+
+impl Options {
+    /// Show the options in the ui.
+    pub fn ui(&mut self, ui: &mut crate::Ui) {
+        let Self {
+            style,          // covered above
+            zoom_factor: _, // TODO(emilk)
+            zoom_with_keyboard,
+            tessellation_options,
+            repaint_on_widget_change,
+            screen_reader: _, // needs to come from the integration
+            preload_font_glyphs: _,
+            warn_on_id_clash,
+
+            line_scroll_speed,
+            scroll_zoom_speed,
+            reduce_texture_memory,
+        } = self;
+
+        use crate::Widget as _;
+
+        CollapsingHeader::new("⚙ Options")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.checkbox(
+                    repaint_on_widget_change,
+                    "Repaint if any widget moves or changes id",
+                );
+
+                ui.checkbox(
+                    zoom_with_keyboard,
+                    "Zoom with keyboard (Cmd +, Cmd -, Cmd 0)",
+                );
+
+                ui.checkbox(warn_on_id_clash, "Warn if two widgets have the same Id");
+
+                ui.checkbox(reduce_texture_memory, "Reduce texture memory");
+            });
+
+        use crate::containers::*;
+        CollapsingHeader::new("🎑 Style")
+            .default_open(true)
+            .show(ui, |ui| {
+                std::sync::Arc::make_mut(style).ui(ui);
+            });
+
+        CollapsingHeader::new("✒ Painting")
+            .default_open(false)
+            .show(ui, |ui| {
+                tessellation_options.ui(ui);
+                ui.vertical_centered(|ui| {
+                    crate::reset_button(ui, tessellation_options, "Reset paint settings");
+                });
+            });
+
+        CollapsingHeader::new("🖱 Input")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Line scroll speed");
+                    ui.add(crate::DragValue::new(line_scroll_speed).range(0.0..=f32::INFINITY))
+                        .on_hover_text(
+                            "How many lines to scroll with each tick of the mouse wheel",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Scroll zoom speed");
+                    ui.add(
+                        crate::DragValue::new(scroll_zoom_speed)
+                            .range(0.0..=f32::INFINITY)
+                            .speed(0.001),
+                    )
+                    .on_hover_text("How fast to zoom with ctrl/cmd + scroll");
+                });
+            });
+
+        ui.vertical_centered(|ui| crate::reset_button(ui, self, "Reset all"));
     }
 }
 
 // ----------------------------------------------------------------------------
 
+/// The state of the interaction in egui,
+/// i.e. what is being dragged.
+///
 /// Say there is a button in a scroll area.
 /// If the user clicks the button, the button should click.
 /// If the user drags the button we should scroll the scroll area.
@@ -193,29 +370,17 @@ impl Default for Options {
 /// If the user releases the button without moving the mouse we register it as a click on `click_id`.
 /// If the cursor moves too much we clear the `click_id` and start passing move events to `drag_id`.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Interaction {
+pub(crate) struct InteractionState {
     /// A widget interested in clicks that has a mouse press on it.
-    pub click_id: Option<Id>,
+    pub potential_click_id: Option<Id>,
 
     /// A widget interested in drags that has a mouse press on it.
-    pub drag_id: Option<Id>,
-
-    pub focus: Focus,
-
-    /// HACK: windows have low priority on dragging.
-    /// This is so that if you drag a slider in a window,
-    /// the slider will steal the drag away from the window.
-    /// This is needed because we do window interaction first (to prevent frame delay),
-    /// and then do content layout.
-    pub drag_is_window: bool,
-
-    /// Any interest in catching clicks this frame?
-    /// Cleared to false at start of each frame.
-    pub click_interest: bool,
-
-    /// Any interest in catching clicks this frame?
-    /// Cleared to false at start of each frame.
-    pub drag_interest: bool,
+    ///
+    /// Note that this is set as soon as the mouse is pressed,
+    /// so the widget may not yet be marked as "dragged",
+    /// as that can only happen after the mouse has moved a bit
+    /// (at least if the widget is interesated in both clicks and drags).
+    pub potential_drag_id: Option<Id>,
 }
 
 /// Keeps tracks of what widget has keyboard focus
@@ -263,31 +428,10 @@ impl FocusWidget {
     }
 }
 
-impl Interaction {
+impl InteractionState {
     /// Are we currently clicking or dragging an egui widget?
     pub fn is_using_pointer(&self) -> bool {
-        self.click_id.is_some() || self.drag_id.is_some()
-    }
-
-    fn begin_frame(
-        &mut self,
-        prev_input: &crate::input_state::InputState,
-        new_input: &crate::data::input::RawInput,
-    ) {
-        self.click_interest = false;
-        self.drag_interest = false;
-
-        if !prev_input.pointer.could_any_button_be_click() {
-            self.click_id = None;
-        }
-
-        if !prev_input.pointer.any_down() || prev_input.pointer.latest_pos().is_none() {
-            // pointer button was not down last frame
-            self.click_id = None;
-            self.drag_id = None;
-        }
-
-        self.focus.begin_frame(new_input);
+        self.potential_click_id.is_some() || self.potential_drag_id.is_some()
     }
 }
 
@@ -415,6 +559,13 @@ impl Focus {
             // nothing has focus and the user pressed tab - give focus to the first widgets that wants it:
             self.focused_widget = Some(FocusWidget::new(id));
             self.reset_focus();
+        } else if self.focus_direction == FocusDirection::Previous
+            && self.focused_widget.is_none()
+            && !self.give_to_next
+        {
+            // nothing has focus and the user pressed Shift+Tab - give focus to the last widgets that wants it:
+            self.focused_widget = self.last_interested.map(FocusWidget::new);
+            self.reset_focus();
         }
 
         self.last_interested = Some(id);
@@ -439,9 +590,7 @@ impl Focus {
             }
         }
 
-        let Some(current_focused) = self.focused_widget else {
-            return None;
-        };
+        let current_focused = self.focused_widget?;
 
         // In what direction we are looking for the next widget.
         let search_direction = match self.focus_direction {
@@ -464,9 +613,7 @@ impl Focus {
             }
         });
 
-        let Some(current_rect) = self.focus_widgets_cache.get(&current_focused.id) else {
-            return None;
-        };
+        let current_rect = self.focus_widgets_cache.get(&current_focused.id)?;
 
         let mut best_score = std::f32::INFINITY;
         let mut best_id = None;
@@ -505,38 +652,59 @@ impl Focus {
 }
 
 impl Memory {
-    pub(crate) fn begin_frame(
-        &mut self,
-        prev_input: &crate::input_state::InputState,
-        new_input: &crate::data::input::RawInput,
-    ) {
+    pub(crate) fn begin_frame(&mut self, new_raw_input: &RawInput, viewports: &ViewportIdSet) {
         crate::profile_function!();
-        self.interaction.begin_frame(prev_input, new_input);
 
-        if !prev_input.pointer.any_down() {
-            self.window_interaction = None;
-        }
+        self.viewport_id = new_raw_input.viewport_id;
+
+        // Cleanup
+        self.interactions.retain(|id, _| viewports.contains(id));
+        self.areas.retain(|id, _| viewports.contains(id));
+
+        self.areas.entry(self.viewport_id).or_default();
+
+        // self.interactions  is handled elsewhere
+
+        self.focus
+            .entry(self.viewport_id)
+            .or_default()
+            .begin_frame(new_raw_input);
     }
 
-    pub(crate) fn end_frame(&mut self, input: &InputState, used_ids: &IdMap<Rect>) {
+    pub(crate) fn end_frame(&mut self, used_ids: &IdMap<Rect>) {
         self.caches.update();
-        self.areas.end_frame();
-        self.interaction.focus.end_frame(used_ids);
-        self.drag_value.end_frame(input);
+        self.areas_mut().end_frame();
+        self.focus_mut().end_frame(used_ids);
+    }
+
+    pub(crate) fn set_viewport_id(&mut self, viewport_id: ViewportId) {
+        self.viewport_id = viewport_id;
+    }
+
+    /// Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
+    pub fn areas(&self) -> &Areas {
+        self.areas
+            .get(&self.viewport_id)
+            .expect("Memory broken: no area for the current viewport")
+    }
+
+    /// Access memory of the [`Area`](crate::containers::area::Area)s, such as `Window`s.
+    pub fn areas_mut(&mut self) -> &mut Areas {
+        self.areas.entry(self.viewport_id).or_default()
     }
 
     /// Top-most layer at the given position.
-    pub fn layer_id_at(&self, pos: Pos2, resize_interact_radius_side: f32) -> Option<LayerId> {
-        self.areas.layer_id_at(pos, resize_interact_radius_side)
+    pub fn layer_id_at(&self, pos: Pos2) -> Option<LayerId> {
+        self.areas().layer_id_at(pos, &self.layer_transforms)
     }
 
     /// An iterator over all layers. Back-to-front. Top is last.
     pub fn layer_ids(&self) -> impl ExactSizeIterator<Item = LayerId> + '_ {
-        self.areas.order().iter().copied()
+        self.areas().order().iter().copied()
     }
 
     pub(crate) fn had_focus_last_frame(&self, id: Id) -> bool {
-        self.interaction.focus.id_previous_frame == Some(id)
+        self.focus().and_then(|f| f.id_previous_frame) == Some(id)
     }
 
     /// True if the given widget had keyboard focus last frame, but not this one.
@@ -557,12 +725,12 @@ impl Memory {
     /// from the window and back.
     #[inline(always)]
     pub fn has_focus(&self, id: Id) -> bool {
-        self.interaction.focus.focused() == Some(id)
+        self.focused() == Some(id)
     }
 
     /// Which widget has keyboard focus?
-    pub fn focus(&self) -> Option<Id> {
-        self.interaction.focus.focused()
+    pub fn focused(&self) -> Option<Id> {
+        self.focus().and_then(|f| f.focused())
     }
 
     /// Set an event filter for a widget.
@@ -573,7 +741,7 @@ impl Memory {
     /// You must first give focus to the widget before calling this.
     pub fn set_focus_lock_filter(&mut self, id: Id, event_filter: EventFilter) {
         if self.had_focus_last_frame(id) && self.has_focus(id) {
-            if let Some(focused) = &mut self.interaction.focus.focused_widget {
+            if let Some(focused) = &mut self.focus_mut().focused_widget {
                 if focused.id == id {
                     focused.filter = event_filter;
                 }
@@ -581,34 +749,20 @@ impl Memory {
         }
     }
 
-    /// Set an event filter for a widget.
-    ///
-    /// You must first give focus to the widget before calling this.
-    #[deprecated = "Use set_focus_lock_filter instead"]
-    pub fn lock_focus(&mut self, id: Id, lock_focus: bool) {
-        self.set_focus_lock_filter(
-            id,
-            EventFilter {
-                tab: lock_focus,
-                arrows: lock_focus,
-                escape: false,
-            },
-        );
-    }
-
     /// Give keyboard focus to a specific widget.
     /// See also [`crate::Response::request_focus`].
     #[inline(always)]
     pub fn request_focus(&mut self, id: Id) {
-        self.interaction.focus.focused_widget = Some(FocusWidget::new(id));
+        self.focus_mut().focused_widget = Some(FocusWidget::new(id));
     }
 
     /// Surrender keyboard focus for a specific widget.
     /// See also [`crate::Response::surrender_focus`].
     #[inline(always)]
     pub fn surrender_focus(&mut self, id: Id) {
-        if self.interaction.focus.focused() == Some(id) {
-            self.interaction.focus.focused_widget = None;
+        let focus = self.focus_mut();
+        if focus.focused() == Some(id) {
+            focus.focused_widget = None;
         }
     }
 
@@ -621,54 +775,105 @@ impl Memory {
     /// and rendered correctly in a single frame.
     #[inline(always)]
     pub fn interested_in_focus(&mut self, id: Id) {
-        self.interaction.focus.interested_in_focus(id);
+        self.focus_mut().interested_in_focus(id);
     }
 
     /// Stop editing of active [`TextEdit`](crate::TextEdit) (if any).
     #[inline(always)]
     pub fn stop_text_input(&mut self) {
-        self.interaction.focus.focused_widget = None;
+        self.focus_mut().focused_widget = None;
     }
 
     /// Is any widget being dragged?
+    #[deprecated = "Use `Context::dragged_id` instead"]
     #[inline(always)]
     pub fn is_anything_being_dragged(&self) -> bool {
-        self.interaction.drag_id.is_some()
+        self.interaction().potential_drag_id.is_some()
     }
 
     /// Is this specific widget being dragged?
+    ///
+    /// Usually it is better to use [`crate::Response::dragged`].
+    ///
+    /// A widget that sense both clicks and drags is only marked as "dragged"
+    /// when the mouse has moved a bit, but `is_being_dragged` will return true immediately.
+    #[deprecated = "Use `Context::is_being_dragged` instead"]
     #[inline(always)]
     pub fn is_being_dragged(&self, id: Id) -> bool {
-        self.interaction.drag_id == Some(id)
+        self.interaction().potential_drag_id == Some(id)
+    }
+
+    /// Get the id of the widget being dragged, if any.
+    ///
+    /// Note that this is set as soon as the mouse is pressed,
+    /// so the widget may not yet be marked as "dragged",
+    /// as that can only happen after the mouse has moved a bit
+    /// (at least if the widget is interesated in both clicks and drags).
+    #[deprecated = "Use `Context::dragged_id` instead"]
+    #[inline(always)]
+    pub fn dragged_id(&self) -> Option<Id> {
+        self.interaction().potential_drag_id
     }
 
     /// Set which widget is being dragged.
     #[inline(always)]
+    #[deprecated = "Use `Context::set_dragged_id` instead"]
     pub fn set_dragged_id(&mut self, id: Id) {
-        self.interaction.drag_id = Some(id);
+        self.interaction_mut().potential_drag_id = Some(id);
     }
 
     /// Stop dragging any widget.
     #[inline(always)]
+    #[deprecated = "Use `Context::stop_dragging` instead"]
     pub fn stop_dragging(&mut self) {
-        self.interaction.drag_id = None;
+        self.interaction_mut().potential_drag_id = None;
+    }
+
+    /// Is something else being dragged?
+    ///
+    /// Returns true if we are dragging something, but not the given widget.
+    #[inline(always)]
+    #[deprecated = "Use `Context::dragging_something_else` instead"]
+    pub fn dragging_something_else(&self, not_this: Id) -> bool {
+        let drag_id = self.interaction().potential_drag_id;
+        drag_id.is_some() && drag_id != Some(not_this)
     }
 
     /// Forget window positions, sizes etc.
     /// Can be used to auto-layout windows.
     pub fn reset_areas(&mut self) {
-        self.areas = Default::default();
+        for area in self.areas.values_mut() {
+            *area = Default::default();
+        }
     }
 
     /// Obtain the previous rectangle of an area.
     pub fn area_rect(&self, id: impl Into<Id>) -> Option<Rect> {
-        self.areas.get(id.into()).map(|state| state.rect())
+        self.areas().get(id.into()).map(|state| state.rect())
+    }
+
+    pub(crate) fn interaction(&self) -> &InteractionState {
+        self.interactions
+            .get(&self.viewport_id)
+            .expect("Failed to get interaction")
+    }
+
+    pub(crate) fn interaction_mut(&mut self) -> &mut InteractionState {
+        self.interactions.entry(self.viewport_id).or_default()
+    }
+
+    pub(crate) fn focus(&self) -> Option<&Focus> {
+        self.focus.get(&self.viewport_id)
+    }
+
+    pub(crate) fn focus_mut(&mut self) -> &mut Focus {
+        self.focus.entry(self.viewport_id).or_default()
     }
 }
 
 /// ## Popups
 /// Popups are things like combo-boxes, color pickers, menus etc.
-/// Only one can be be open at a time.
+/// Only one can be open at a time.
 impl Memory {
     /// Is the given popup open?
     pub fn is_popup_open(&self, popup_id: Id) -> bool {
@@ -724,12 +929,12 @@ impl Memory {
 // ----------------------------------------------------------------------------
 
 /// Keeps track of [`Area`](crate::containers::area::Area)s, which are free-floating [`Ui`](crate::Ui)s.
-/// These [`Area`](crate::containers::area::Area)s can be in any [`Order`](crate::Order).
+/// These [`Area`](crate::containers::area::Area)s can be in any [`Order`].
 #[derive(Clone, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct Areas {
-    areas: IdMap<area::State>,
+    areas: IdMap<area::AreaState>,
 
     /// Back-to-front. Top is last.
     order: Vec<LayerId>,
@@ -743,6 +948,11 @@ pub struct Areas {
     /// So if you close three windows and then reopen them all in one frame,
     /// they will all be sent to the top, but keep their previous internal order.
     wants_to_be_on_top: ahash::HashSet<LayerId>,
+
+    /// List of sublayers for each layer
+    ///
+    /// When a layer has sublayers, they are moved directly above it in the ordering.
+    sublayers: ahash::HashMap<LayerId, HashSet<LayerId>>,
 }
 
 impl Areas {
@@ -750,7 +960,7 @@ impl Areas {
         self.areas.len()
     }
 
-    pub(crate) fn get(&self, id: Id) -> Option<&area::State> {
+    pub(crate) fn get(&self, id: Id) -> Option<&area::AreaState> {
         self.areas.get(&id)
     }
 
@@ -759,7 +969,16 @@ impl Areas {
         &self.order
     }
 
-    pub(crate) fn set_state(&mut self, layer_id: LayerId, state: area::State) {
+    /// For each layer, which order is it in [`Self::order`]?
+    pub(crate) fn order_map(&self) -> HashMap<LayerId, usize> {
+        self.order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect()
+    }
+
+    pub(crate) fn set_state(&mut self, layer_id: LayerId, state: area::AreaState) {
         self.visible_current_frame.insert(layer_id);
         self.areas.insert(layer_id.id, state);
         if !self.order.iter().any(|x| *x == layer_id) {
@@ -768,14 +987,20 @@ impl Areas {
     }
 
     /// Top-most layer at the given position.
-    pub fn layer_id_at(&self, pos: Pos2, resize_interact_radius_side: f32) -> Option<LayerId> {
+    pub fn layer_id_at(
+        &self,
+        pos: Pos2,
+        layer_transforms: &HashMap<LayerId, TSTransform>,
+    ) -> Option<LayerId> {
         for layer in self.order.iter().rev() {
             if self.is_visible(layer) {
                 if let Some(state) = self.areas.get(&layer.id) {
                     let mut rect = state.rect();
                     if state.interactable {
-                        // Allow us to resize by dragging just outside the window:
-                        rect = rect.expand(resize_interact_radius_side);
+                        if let Some(transform) = layer_transforms.get(layer) {
+                            rect = *transform * rect;
+                        }
+
                         if rect.contains(pos) {
                             return Some(*layer);
                         }
@@ -802,12 +1027,12 @@ impl Areas {
             .collect()
     }
 
-    pub(crate) fn visible_windows(&self) -> Vec<&area::State> {
+    pub(crate) fn visible_windows(&self) -> impl Iterator<Item = (LayerId, &area::AreaState)> {
         self.visible_layer_ids()
-            .iter()
+            .into_iter()
             .filter(|layer| layer.order == crate::Order::Middle)
-            .filter_map(|layer| self.get(layer.id))
-            .collect()
+            .filter(|&layer| !self.is_sublayer(&layer))
+            .filter_map(|layer| Some((layer, self.get(layer.id)?)))
     }
 
     pub fn move_to_top(&mut self, layer_id: LayerId) {
@@ -819,12 +1044,38 @@ impl Areas {
         }
     }
 
+    /// Mark the `child` layer as a sublayer of `parent`.
+    ///
+    /// Sublayers are moved directly above the parent layer at the end of the frame. This is mainly
+    /// intended for adding a new [Area](crate::Area) inside a [Window](crate::Window).
+    ///
+    /// This currently only supports one level of nesting. If `parent` is a sublayer of another
+    /// layer, the behavior is unspecified.
+    pub fn set_sublayer(&mut self, parent: LayerId, child: LayerId) {
+        self.sublayers.entry(parent).or_default().insert(child);
+    }
+
+    pub fn top_layer_id(&self, order: Order) -> Option<LayerId> {
+        self.order
+            .iter()
+            .filter(|layer| layer.order == order && !self.is_sublayer(layer))
+            .last()
+            .copied()
+    }
+
+    pub(crate) fn is_sublayer(&self, layer: &LayerId) -> bool {
+        self.sublayers
+            .iter()
+            .any(|(_, children)| children.contains(layer))
+    }
+
     pub(crate) fn end_frame(&mut self) {
         let Self {
             visible_last_frame,
             visible_current_frame,
             order,
             wants_to_be_on_top,
+            sublayers,
             ..
         } = self;
 
@@ -832,6 +1083,23 @@ impl Areas {
         visible_current_frame.clear();
         order.sort_by_key(|layer| (layer.order, wants_to_be_on_top.contains(layer)));
         wants_to_be_on_top.clear();
+        // For all layers with sublayers, put the sublayers directly after the parent layer:
+        let sublayers = std::mem::take(sublayers);
+        for (parent, children) in sublayers {
+            let mut moved_layers = vec![parent];
+            order.retain(|l| {
+                if children.contains(l) {
+                    moved_layers.push(*l);
+                    false
+                } else {
+                    true
+                }
+            });
+            let Some(parent_pos) = order.iter().position(|l| l == &parent) else {
+                continue;
+            };
+            order.splice(parent_pos..=parent_pos, moved_layers);
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 //! Try the live web demo: <https://www.egui.rs/#demo>. Read more about egui at <https://github.com/emilk/egui>.
 //!
 //! `egui` is in heavy development, with each new version having breaking changes.
-//! You need to have rust 1.62.0 or later to use `egui`.
+//! You need to have rust 1.76.0 or later to use `egui`.
 //!
 //! To quickly get started with egui, you can take a look at [`eframe_template`](https://github.com/emilk/eframe_template)
 //! which uses [`eframe`](https://docs.rs/eframe).
@@ -96,13 +96,17 @@
 //! # });
 //! ```
 //!
+//! ## Viewports
+//! Some egui backends support multiple _viewports_, which is what egui calls the native OS windows it resides in.
+//! See [`crate::viewport`] for more information.
+//!
 //! ## Coordinate system
 //! The left-top corner of the screen is `(0.0, 0.0)`,
 //! with X increasing to the right and Y increasing downwards.
 //!
 //! `egui` uses logical _points_ as its coordinate system.
 //! Those related to physical _pixels_ by the `pixels_per_point` scale factor.
-//! For example, a high-dpi screeen can have `pixels_per_point = 2.0`,
+//! For example, a high-dpi screen can have `pixels_per_point = 2.0`,
 //! meaning there are two physical screen pixels for each logical point.
 //!
 //! Angles are in radians, and are measured clockwise from the X-axis, which has angle=0.
@@ -134,7 +138,7 @@
 //!         });
 //!     });
 //!     handle_platform_output(full_output.platform_output);
-//!     let clipped_primitives = ctx.tessellate(full_output.shapes); // create triangles to paint
+//!     let clipped_primitives = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 //!     paint(full_output.textures_delta, clipped_primitives);
 //! }
 //! ```
@@ -263,6 +267,37 @@
 //! }
 //! ```
 //!
+//!
+//! ## Widget interaction
+//! Each widget has a [`Sense`], which defines whether or not the widget
+//! is sensitive to clickicking and/or drags.
+//!
+//! For instance, a [`Button`] only has a [`Sense::click`] (by default).
+//! This means if you drag a button it will not respond with [`Response::dragged`].
+//! Instead, the drag will continue through the button to the first
+//! widget behind it that is sensitive to dragging, which for instance could be
+//! a [`ScrollArea`]. This lets you scroll by dragging a scroll area (important
+//! on touch screens), just as long as you don't drag on a widget that is sensitive
+//! to drags (e.g. a [`Slider`]).
+//!
+//! When widgets overlap it is the last added one
+//! that is considered to be on top and which will get input priority.
+//!
+//! The widget interaction logic is run at the _start_ of each frame,
+//! based on the output from the previous frame.
+//! This means that when a new widget shows up you cannot click it in the same
+//! frame (i.e. in the same fraction of a second), but unless the user
+//! is spider-man, they wouldn't be fast enough to do so anyways.
+//!
+//! By running the interaction code early, egui can actually
+//! tell you if a widget is being interacted with _before_ you add it,
+//! as long as you know its [`Id`] before-hand (e.g. using [`Ui::next_auto_id`]),
+//! by calling [`Context::read_response`].
+//! This can be useful in some circumstances in order to style a widget,
+//! or to respond to interactions before adding the widget
+//! (perhaps on top of other widgets).
+//!
+//!
 //! ## Auto-sizing panels and windows
 //! In egui, all panels and windows auto-shrink to fit the content.
 //! If the window or panel is also resizable, this can lead to a weird behavior
@@ -303,6 +338,7 @@
 //! ## Code snippets
 //!
 //! ```
+//! # use egui::TextWrapMode;
 //! # egui::__run_test_ui(|ui| {
 //! # let mut some_bool = true;
 //! // Miscellaneous tips and tricks
@@ -323,26 +359,33 @@
 //! ui.scope(|ui| {
 //!     ui.visuals_mut().override_text_color = Some(egui::Color32::RED);
 //!     ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-//!     ui.style_mut().wrap = Some(false);
+//!     ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
 //!
 //!     ui.label("This text will be red, monospace, and won't wrap to a new line");
 //! }); // the temporary settings are reverted here
 //! # });
 //! ```
+//!
+//! ## Installing additional fonts
+//! The default egui fonts only support latin and cryllic characters, and some emojis.
+//! To use egui with e.g. asian characters you need to install your own font (`.ttf` or `.otf`) using [`Context::set_fonts`].
 
 #![allow(clippy::float_cmp)]
 #![allow(clippy::manual_range_contains)]
-#![forbid(unsafe_code)]
 
 mod animation_manager;
 pub mod containers;
 mod context;
 mod data;
+pub mod debug_text;
+mod drag_and_drop;
 mod frame_state;
 pub(crate) mod grid;
 pub mod gui_zoom;
+mod hit_test;
 mod id;
 mod input_state;
+mod interaction;
 pub mod introspection;
 pub mod layers;
 mod layout;
@@ -355,8 +398,12 @@ pub(crate) mod placer;
 mod response;
 mod sense;
 pub mod style;
+pub mod text_selection;
 mod ui;
+mod ui_stack;
 pub mod util;
+pub mod viewport;
+mod widget_rect;
 pub mod widget_text;
 pub mod widgets;
 
@@ -377,18 +424,18 @@ pub use epaint::emath;
 pub use ecolor::hex_color;
 pub use ecolor::{Color32, Rgba};
 pub use emath::{
-    lerp, pos2, remap, remap_clamp, vec2, Align, Align2, NumExt, Pos2, Rangef, Rect, Vec2,
+    lerp, pos2, remap, remap_clamp, vec2, Align, Align2, NumExt, Pos2, Rangef, Rect, Vec2, Vec2b,
 };
 pub use epaint::{
     mutex,
     text::{FontData, FontDefinitions, FontFamily, FontId, FontTweak},
-    textures::{TextureFilter, TextureOptions, TexturesDelta},
-    ClippedPrimitive, ColorImage, FontImage, ImageData, Mesh, PaintCallback, PaintCallbackInfo,
-    Rounding, Shape, Stroke, TextureHandle, TextureId,
+    textures::{TextureFilter, TextureOptions, TextureWrapMode, TexturesDelta},
+    ClippedPrimitive, ColorImage, FontImage, ImageData, Margin, Mesh, PaintCallback,
+    PaintCallbackInfo, Rounding, Shadow, Shape, Stroke, TextureHandle, TextureId,
 };
 
 pub mod text {
-    pub use crate::text_edit::CCursorRange;
+    pub use crate::text_selection::{CCursorRange, CursorRange};
     pub use epaint::text::{
         cursor::CCursor, FontData, FontDefinitions, FontFamily, Fonts, Galley, LayoutJob,
         LayoutSection, TextFormat, TextWrapping, TAB_SIZE,
@@ -397,13 +444,16 @@ pub mod text {
 
 pub use {
     containers::*,
-    context::{Context, RequestRepaintInfo},
+    context::{Context, RepaintCause, RequestRepaintInfo},
     data::{
         input::*,
         output::{
             self, CursorIcon, FullOutput, OpenUrl, PlatformOutput, UserAttentionType, WidgetInfo,
         },
+        Key,
     },
+    drag_and_drop::DragAndDrop,
+    epaint::text::TextWrapMode,
     grid::Grid,
     id::{Id, IdMap},
     input_state::{InputState, MultiTouchInfo, PointerState},
@@ -414,9 +464,12 @@ pub use {
     painter::Painter,
     response::{InnerResponse, Response},
     sense::Sense,
-    style::{FontSelection, Margin, Style, TextStyle, Visuals},
+    style::{FontSelection, Style, TextStyle, Visuals},
     text::{Galley, TextFormat},
     ui::Ui,
+    ui_stack::*,
+    viewport::*,
+    widget_rect::{WidgetRect, WidgetRects},
     widget_text::{RichText, WidgetText},
     widgets::*,
 };
@@ -458,7 +511,7 @@ pub fn warn_if_debug_build(ui: &mut crate::Ui) {
 /// ```
 #[macro_export]
 macro_rules! include_image {
-    ($path: literal) => {
+    ($path:expr $(,)?) => {
         $crate::ImageSource::Bytes {
             uri: ::std::borrow::Cow::Borrowed(concat!("bytes://", $path)),
             bytes: $crate::load::Bytes::Static(include_bytes!($path)),
@@ -466,7 +519,7 @@ macro_rules! include_image {
     };
 }
 
-/// Create a [`Hyperlink`](crate::Hyperlink) to the current [`file!()`] (and line) on Github
+/// Create a [`Hyperlink`] to the current [`file!()`] (and line) on Github
 ///
 /// ```
 /// # egui::__run_test_ui(|ui| {
@@ -481,7 +534,7 @@ macro_rules! github_link_file_line {
     }};
 }
 
-/// Create a [`Hyperlink`](crate::Hyperlink) to the current [`file!()`] on github.
+/// Create a [`Hyperlink`] to the current [`file!()`] on github.
 ///
 /// ```
 /// # egui::__run_test_ui(|ui| {
@@ -494,22 +547,6 @@ macro_rules! github_link_file {
         let url = format!("{}{}", $github_url, file!());
         $crate::Hyperlink::from_label_and_url($label, url)
     }};
-}
-
-// ----------------------------------------------------------------------------
-
-/// An assert that is only active when `egui` is compiled with the `extra_asserts` feature
-/// or with the `extra_debug_asserts` feature in debug builds.
-#[macro_export]
-macro_rules! egui_assert {
-    ($($arg: tt)*) => {
-        if cfg!(any(
-            feature = "extra_asserts",
-            all(feature = "extra_debug_asserts", debug_assertions),
-        )) {
-            assert!($($arg)*);
-        }
-    }
 }
 
 // ----------------------------------------------------------------------------
@@ -591,6 +628,8 @@ pub enum WidgetType {
     ImageButton,
 
     CollapsingHeader,
+
+    ProgressIndicator,
 
     /// If you cannot fit any of the above slots.
     ///

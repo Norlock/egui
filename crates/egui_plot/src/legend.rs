@@ -14,12 +14,12 @@ pub enum Corner {
 }
 
 impl Corner {
-    pub fn all() -> impl Iterator<Item = Corner> {
+    pub fn all() -> impl Iterator<Item = Self> {
         [
-            Corner::LeftTop,
-            Corner::RightTop,
-            Corner::LeftBottom,
-            Corner::RightBottom,
+            Self::LeftTop,
+            Self::RightTop,
+            Self::LeftBottom,
+            Self::RightBottom,
         ]
         .iter()
         .copied()
@@ -32,6 +32,9 @@ pub struct Legend {
     pub text_style: TextStyle,
     pub background_alpha: f32,
     pub position: Corner,
+
+    /// Used for overriding the `hidden_items` set in [`LegendWidget`].
+    hidden_items: Option<ahash::HashSet<String>>,
 }
 
 impl Default for Legend {
@@ -40,26 +43,42 @@ impl Default for Legend {
             text_style: TextStyle::Body,
             background_alpha: 0.75,
             position: Corner::RightTop,
+
+            hidden_items: None,
         }
     }
 }
 
 impl Legend {
     /// Which text style to use for the legend. Default: `TextStyle::Body`.
+    #[inline]
     pub fn text_style(mut self, style: TextStyle) -> Self {
         self.text_style = style;
         self
     }
 
     /// The alpha of the legend background. Default: `0.75`.
+    #[inline]
     pub fn background_alpha(mut self, alpha: f32) -> Self {
         self.background_alpha = alpha;
         self
     }
 
     /// In which corner to place the legend. Default: `Corner::RightTop`.
+    #[inline]
     pub fn position(mut self, corner: Corner) -> Self {
         self.position = corner;
+        self
+    }
+
+    /// Specifies hidden items in the legend configuration to override the existing ones. This
+    /// allows the legend traces' visibility to be controlled from the application code.
+    #[inline]
+    pub fn hidden_items<I>(mut self, hidden_items: I) -> Self
+    where
+        I: IntoIterator<Item = String>,
+    {
+        self.hidden_items = Some(hidden_items.into_iter().collect());
         self
     }
 }
@@ -80,11 +99,11 @@ impl LegendEntry {
         }
     }
 
-    fn ui(&mut self, ui: &mut Ui, text: String, text_style: &TextStyle) -> Response {
+    fn ui(&self, ui: &mut Ui, text: String, text_style: &TextStyle) -> Response {
         let Self {
             color,
             checked,
-            hovered,
+            hovered: _,
         } = self;
 
         let font_id = text_style.resolve(ui.style());
@@ -98,8 +117,14 @@ impl LegendEntry {
         let desired_size = total_extra + galley.size();
         let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
 
-        response
-            .widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, *checked, galley.text()));
+        response.widget_info(|| {
+            WidgetInfo::selected(
+                WidgetType::Checkbox,
+                ui.is_enabled(),
+                *checked,
+                galley.text(),
+            )
+        });
 
         let visuals = ui.style().interact(&response);
         let label_on_the_left = ui.layout().horizontal_placement() == Align::RIGHT;
@@ -141,10 +166,7 @@ impl LegendEntry {
         };
 
         let text_position = pos2(text_position_x, rect.center().y - 0.5 * galley.size().y);
-        painter.galley_with_color(text_position, galley, visuals.text_color());
-
-        *checked ^= response.clicked_by(PointerButton::Primary);
-        *hovered = response.hovered();
+        painter.galley(text_position, galley, visuals.text_color());
 
         response
     }
@@ -164,8 +186,11 @@ impl LegendWidget {
         rect: Rect,
         config: Legend,
         items: &[Box<dyn PlotItem>],
-        hidden_items: &ahash::HashSet<String>,
+        hidden_items: &ahash::HashSet<String>, // Existing hidden items in the plot memory.
     ) -> Option<Self> {
+        // If `config.hidden_items` is not `None`, it is used.
+        let hidden_items = config.hidden_items.as_ref().unwrap_or(hidden_items);
+
         // Collect the legend entries. If multiple items have the same name, they share a
         // checkbox. If their colors don't match, we pick a neutral color for the checkbox.
         let mut entries: BTreeMap<String, LegendEntry> = BTreeMap::new();
@@ -204,7 +229,7 @@ impl LegendWidget {
     }
 
     // Get the name of the hovered items.
-    pub fn hovered_entry_name(&self) -> Option<String> {
+    pub fn hovered_item_name(&self) -> Option<String> {
         self.entries
             .iter()
             .find(|(_, entry)| entry.hovered)
@@ -231,7 +256,7 @@ impl Widget for &mut LegendWidget {
         let layout = Layout::from_main_dir_and_cross_align(main_dir, cross_align);
         let legend_pad = 4.0;
         let legend_rect = rect.shrink(legend_pad);
-        let mut legend_ui = ui.child_ui(legend_rect, layout);
+        let mut legend_ui = ui.child_ui(legend_rect, layout, None);
         legend_ui
             .scope(|ui| {
                 let background_frame = Frame {
@@ -245,14 +270,55 @@ impl Widget for &mut LegendWidget {
                 .multiply_with_opacity(config.background_alpha);
                 background_frame
                     .show(ui, |ui| {
-                        entries
+                        let mut focus_on_item = None;
+
+                        let response_union = entries
                             .iter_mut()
-                            .map(|(name, entry)| entry.ui(ui, name.clone(), &config.text_style))
+                            .map(|(name, entry)| {
+                                let response = entry.ui(ui, name.clone(), &config.text_style);
+
+                                // Handle interactions. Alt-clicking must be deferred to end of loop
+                                // since it may affect all entries.
+                                handle_interaction_on_legend_item(&response, entry);
+                                if response.clicked() && ui.input(|r| r.modifiers.alt) {
+                                    focus_on_item = Some(name.clone());
+                                }
+
+                                response
+                            })
                             .reduce(|r1, r2| r1.union(r2))
-                            .unwrap()
+                            .unwrap();
+
+                        if let Some(focus_on_item) = focus_on_item {
+                            handle_focus_on_legend_item(&focus_on_item, entries);
+                        }
+
+                        response_union
                     })
                     .inner
             })
             .inner
+    }
+}
+
+/// Handle per-entry interactions.
+fn handle_interaction_on_legend_item(response: &Response, entry: &mut LegendEntry) {
+    entry.checked ^= response.clicked_by(PointerButton::Primary);
+    entry.hovered = response.hovered();
+}
+
+/// Handle alt-click interaction (which may affect all entries).
+fn handle_focus_on_legend_item(
+    clicked_entry_name: &str,
+    entries: &mut BTreeMap<String, LegendEntry>,
+) {
+    // if all other items are already hidden, we show everything
+    let is_focus_item_only_visible = entries
+        .iter()
+        .all(|(name, entry)| !entry.checked || (clicked_entry_name == name));
+
+    // either show everything or show only the focus item
+    for (name, entry) in entries.iter_mut() {
+        entry.checked = is_focus_item_only_visible || clicked_entry_name == name;
     }
 }

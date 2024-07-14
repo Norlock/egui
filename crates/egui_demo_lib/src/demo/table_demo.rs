@@ -1,3 +1,5 @@
+use egui::{TextStyle, TextWrapMode};
+
 #[derive(PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 enum DemoType {
@@ -12,9 +14,12 @@ pub struct TableDemo {
     demo: DemoType,
     striped: bool,
     resizable: bool,
+    clickable: bool,
     num_rows: usize,
     scroll_to_row_slider: usize,
     scroll_to_row: Option<usize>,
+    selection: std::collections::HashSet<usize>,
+    checked: bool,
 }
 
 impl Default for TableDemo {
@@ -23,16 +28,19 @@ impl Default for TableDemo {
             demo: DemoType::Manual,
             striped: true,
             resizable: true,
+            clickable: true,
             num_rows: 10_000,
             scroll_to_row_slider: 0,
             scroll_to_row: None,
+            selection: Default::default(),
+            checked: false,
         }
     }
 }
 
-impl super::Demo for TableDemo {
+impl crate::Demo for TableDemo {
     fn name(&self) -> &'static str {
-        "☰ Table Demo"
+        "☰ Table"
     }
 
     fn show(&mut self, ctx: &egui::Context, open: &mut bool) {
@@ -40,7 +48,7 @@ impl super::Demo for TableDemo {
             .open(open)
             .default_width(400.0)
             .show(ctx, |ui| {
-                use super::View as _;
+                use crate::View as _;
                 self.ui(ui);
             });
     }
@@ -48,12 +56,15 @@ impl super::Demo for TableDemo {
 
 const NUM_MANUAL_ROWS: usize = 20;
 
-impl super::View for TableDemo {
+impl crate::View for TableDemo {
     fn ui(&mut self, ui: &mut egui::Ui) {
+        let mut reset = false;
+
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.striped, "Striped");
                 ui.checkbox(&mut self.resizable, "Resizable columns");
+                ui.checkbox(&mut self.clickable, "Clickable rows");
             });
 
             ui.label("Table type:");
@@ -93,19 +104,22 @@ impl super::View for TableDemo {
                     self.scroll_to_row = Some(self.scroll_to_row_slider);
                 }
             }
+
+            reset = ui.button("Reset").clicked();
         });
 
         ui.separator();
 
         // Leave room for the source code link after the table demo:
+        let body_text_size = TextStyle::Body.resolve(ui.style()).size;
         use egui_extras::{Size, StripBuilder};
         StripBuilder::new(ui)
             .size(Size::remainder().at_least(100.0)) // for the table
-            .size(Size::exact(10.5)) // for the source code link
+            .size(Size::exact(body_text_size)) // for the source code link
             .vertical(|mut strip| {
                 strip.cell(|ui| {
                     egui::ScrollArea::horizontal().show(ui, |ui| {
-                        self.table_ui(ui);
+                        self.table_ui(ui, reset);
                     });
                 });
                 strip.cell(|ui| {
@@ -118,23 +132,42 @@ impl super::View for TableDemo {
 }
 
 impl TableDemo {
-    fn table_ui(&mut self, ui: &mut egui::Ui) {
+    fn table_ui(&mut self, ui: &mut egui::Ui, reset: bool) {
         use egui_extras::{Column, TableBuilder};
 
-        let text_height = egui::TextStyle::Body.resolve(ui.style()).size;
+        let text_height = egui::TextStyle::Body
+            .resolve(ui.style())
+            .size
+            .max(ui.spacing().interact_size.y);
 
+        let available_height = ui.available_height();
         let mut table = TableBuilder::new(ui)
             .striped(self.striped)
             .resizable(self.resizable)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::auto())
-            .column(Column::initial(100.0).range(40.0..=300.0))
-            .column(Column::initial(100.0).at_least(40.0).clip(true))
+            .column(
+                Column::remainder()
+                    .at_least(40.0)
+                    .clip(true)
+                    .resizable(true),
+            )
+            .column(Column::auto())
             .column(Column::remainder())
-            .min_scrolled_height(0.0);
+            .column(Column::remainder())
+            .min_scrolled_height(0.0)
+            .max_scroll_height(available_height);
 
-        if let Some(row_nr) = self.scroll_to_row.take() {
-            table = table.scroll_to_row(row_nr, None);
+        if self.clickable {
+            table = table.sense(egui::Sense::click());
+        }
+
+        if let Some(row_index) = self.scroll_to_row.take() {
+            table = table.scroll_to_row(row_index, None);
+        }
+
+        if reset {
+            table.reset();
         }
 
         table
@@ -143,10 +176,13 @@ impl TableDemo {
                     ui.strong("Row");
                 });
                 header.col(|ui| {
+                    ui.strong("Clipped text");
+                });
+                header.col(|ui| {
                     ui.strong("Expanding content");
                 });
                 header.col(|ui| {
-                    ui.strong("Clipped text");
+                    ui.strong("Interaction");
                 });
                 header.col(|ui| {
                     ui.strong("Content");
@@ -158,88 +194,106 @@ impl TableDemo {
                         let is_thick = thick_row(row_index);
                         let row_height = if is_thick { 30.0 } else { 18.0 };
                         body.row(row_height, |mut row| {
+                            row.set_selected(self.selection.contains(&row_index));
+
                             row.col(|ui| {
                                 ui.label(row_index.to_string());
-                            });
-                            row.col(|ui| {
-                                expanding_content(ui);
                             });
                             row.col(|ui| {
                                 ui.label(long_text(row_index));
                             });
                             row.col(|ui| {
-                                ui.style_mut().wrap = Some(false);
+                                expanding_content(ui);
+                            });
+                            row.col(|ui| {
+                                ui.checkbox(&mut self.checked, "Click me");
+                            });
+                            row.col(|ui| {
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                                 if is_thick {
                                     ui.heading("Extra thick row");
                                 } else {
                                     ui.label("Normal row");
                                 }
                             });
+
+                            self.toggle_row_selection(row_index, &row.response());
                         });
                     }
                 }
                 DemoType::ManyHomogeneous => {
-                    body.rows(text_height, self.num_rows, |row_index, mut row| {
+                    body.rows(text_height, self.num_rows, |mut row| {
+                        let row_index = row.index();
+                        row.set_selected(self.selection.contains(&row_index));
+
                         row.col(|ui| {
                             ui.label(row_index.to_string());
-                        });
-                        row.col(|ui| {
-                            expanding_content(ui);
                         });
                         row.col(|ui| {
                             ui.label(long_text(row_index));
                         });
                         row.col(|ui| {
+                            expanding_content(ui);
+                        });
+                        row.col(|ui| {
+                            ui.checkbox(&mut self.checked, "Click me");
+                        });
+                        row.col(|ui| {
                             ui.add(
-                                egui::Label::new("Thousands of rows of even height").wrap(false),
+                                egui::Label::new("Thousands of rows of even height")
+                                    .wrap_mode(TextWrapMode::Extend),
                             );
                         });
+
+                        self.toggle_row_selection(row_index, &row.response());
                     });
                 }
                 DemoType::ManyHeterogenous => {
-                    fn row_thickness(row_index: usize) -> f32 {
-                        if thick_row(row_index) {
-                            30.0
-                        } else {
-                            18.0
-                        }
-                    }
-                    body.heterogeneous_rows(
-                        (0..self.num_rows).map(row_thickness),
-                        |row_index, mut row| {
-                            row.col(|ui| {
-                                ui.label(row_index.to_string());
-                            });
-                            row.col(|ui| {
-                                expanding_content(ui);
-                            });
-                            row.col(|ui| {
-                                ui.label(long_text(row_index));
-                            });
-                            row.col(|ui| {
-                                ui.style_mut().wrap = Some(false);
-                                if thick_row(row_index) {
-                                    ui.heading("Extra thick row");
-                                } else {
-                                    ui.label("Normal row");
-                                }
-                            });
-                        },
-                    );
+                    let row_height = |i: usize| if thick_row(i) { 30.0 } else { 18.0 };
+                    body.heterogeneous_rows((0..self.num_rows).map(row_height), |mut row| {
+                        let row_index = row.index();
+                        row.set_selected(self.selection.contains(&row_index));
+
+                        row.col(|ui| {
+                            ui.label(row_index.to_string());
+                        });
+                        row.col(|ui| {
+                            ui.label(long_text(row_index));
+                        });
+                        row.col(|ui| {
+                            expanding_content(ui);
+                        });
+                        row.col(|ui| {
+                            ui.checkbox(&mut self.checked, "Click me");
+                        });
+                        row.col(|ui| {
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            if thick_row(row_index) {
+                                ui.heading("Extra thick row");
+                            } else {
+                                ui.label("Normal row");
+                            }
+                        });
+
+                        self.toggle_row_selection(row_index, &row.response());
+                    });
                 }
             });
+    }
+
+    fn toggle_row_selection(&mut self, row_index: usize, row_response: &egui::Response) {
+        if row_response.clicked() {
+            if self.selection.contains(&row_index) {
+                self.selection.remove(&row_index);
+            } else {
+                self.selection.insert(row_index);
+            }
+        }
     }
 }
 
 fn expanding_content(ui: &mut egui::Ui) {
-    let width = ui.available_width().clamp(20.0, 200.0);
-    let height = ui.available_height();
-    let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    ui.painter().hline(
-        rect.x_range(),
-        rect.center().y,
-        (1.0, ui.visuals().text_color()),
-    );
+    ui.add(egui::Separator::default().horizontal());
 }
 
 fn long_text(row_index: usize) -> String {

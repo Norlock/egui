@@ -1,3 +1,5 @@
+use egui::Vec2b;
+
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 enum Plot {
@@ -19,7 +21,7 @@ fn sigmoid(x: f64) -> f64 {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct ContextMenus {
     plot: Plot,
-    show_axes: [bool; 2],
+    show_axes: Vec2b,
     allow_drag: bool,
     allow_zoom: bool,
     allow_scroll: bool,
@@ -33,7 +35,7 @@ impl Default for ContextMenus {
     fn default() -> Self {
         Self {
             plot: Plot::Sin,
-            show_axes: [true, true],
+            show_axes: Vec2b::TRUE,
             allow_drag: true,
             allow_zoom: true,
             allow_scroll: true,
@@ -45,13 +47,13 @@ impl Default for ContextMenus {
     }
 }
 
-impl super::Demo for ContextMenus {
+impl crate::Demo for ContextMenus {
     fn name(&self) -> &'static str {
         "☰ Context Menus"
     }
 
     fn show(&mut self, ctx: &egui::Context, open: &mut bool) {
-        use super::View;
+        use crate::View;
         egui::Window::new(self.name())
             .vscroll(false)
             .resizable(false)
@@ -60,7 +62,7 @@ impl super::Demo for ContextMenus {
     }
 }
 
-impl super::View for ContextMenus {
+impl crate::View for ContextMenus {
     fn ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.menu_button("Click for menu", Self::nested_menus);
@@ -93,13 +95,15 @@ impl super::View for ContextMenus {
                 egui::Grid::new("button_grid").show(ui, |ui| {
                     ui.add(
                         egui::DragValue::new(&mut self.width)
+                            .range(0.0..=f32::INFINITY)
                             .speed(1.0)
-                            .prefix("Width:"),
+                            .prefix("Width: "),
                     );
                     ui.add(
                         egui::DragValue::new(&mut self.height)
+                            .range(0.0..=f32::INFINITY)
                             .speed(1.0)
-                            .prefix("Height:"),
+                            .prefix("Height: "),
                     );
                     ui.end_row();
                     ui.checkbox(&mut self.show_axes[0], "x-Axis");
@@ -152,24 +156,26 @@ impl ContextMenus {
     }
 
     fn nested_menus(ui: &mut egui::Ui) {
-        if ui.button("Open...").clicked() {
+        ui.set_max_width(200.0); // To make sure we wrap long text
+
+        if ui.button("Open…").clicked() {
             ui.close_menu();
         }
         ui.menu_button("SubMenu", |ui| {
             ui.menu_button("SubMenu", |ui| {
-                if ui.button("Open...").clicked() {
+                if ui.button("Open…").clicked() {
                     ui.close_menu();
                 }
                 let _ = ui.button("Item");
             });
             ui.menu_button("SubMenu", |ui| {
-                if ui.button("Open...").clicked() {
+                if ui.button("Open…").clicked() {
                     ui.close_menu();
                 }
                 let _ = ui.button("Item");
             });
             let _ = ui.button("Item");
-            if ui.button("Open...").clicked() {
+            if ui.button("Open…").clicked() {
                 ui.close_menu();
             }
         });
@@ -178,10 +184,10 @@ impl ContextMenus {
             let _ = ui.button("Item2");
             let _ = ui.button("Item3");
             let _ = ui.button("Item4");
-            if ui.button("Open...").clicked() {
+            if ui.button("Open…").clicked() {
                 ui.close_menu();
             }
         });
-        let _ = ui.button("Very long text for this item");
+        let _ = ui.button("Very long text for this item that should be wrapped");
     }
 }
